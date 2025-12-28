@@ -18,7 +18,11 @@ export function decode(base64: string): Uint8Array {
   return bytes;
 }
 
-export async function decodeAudioData(
+/**
+ * Manually decodes raw PCM audio data into an AudioBuffer.
+ * Do NOT use ctx.decodeAudioData for raw PCM streams.
+ */
+export async function decodePcmData(
   data: Uint8Array,
   ctx: AudioContext,
   sampleRate: number,
@@ -31,6 +35,7 @@ export async function decodeAudioData(
   for (let channel = 0; channel < numChannels; channel++) {
     const channelData = buffer.getChannelData(channel);
     for (let i = 0; i < frameCount; i++) {
+      // Convert 16-bit PCM to float range [-1, 1]
       channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
     }
   }

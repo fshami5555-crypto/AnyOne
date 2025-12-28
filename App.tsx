@@ -3,7 +3,7 @@ import React, { useState, useRef, useCallback } from 'react';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { AppState, Persona } from './types.ts';
 import { PERSONAS, AUDIO_SAMPLE_RATE, INPUT_SAMPLE_RATE } from './constants.ts';
-import { decode, decodeAudioData, createPcmBlob } from './services/audioService.ts';
+import { decode, decodePcmData, createPcmBlob } from './services/audioService.ts';
 
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
@@ -21,7 +21,7 @@ const App: React.FC = () => {
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
 
   const cleanup = useCallback(() => {
-    console.log("Cleaning up session...");
+    console.log("Cleanup initiated");
     if (sessionRef.current) {
       try { sessionRef.current.close(); } catch (e) {}
       sessionRef.current = null;
@@ -47,11 +47,16 @@ const App: React.FC = () => {
       setError(null);
       setAppState(AppState.MATCHING);
 
-      // 1. Get Microphone Access
+      // 1. Check API Key
+      if (!process.env.API_KEY) {
+        throw new Error("API Key is missing. Please check your configuration.");
+      }
+
+      // 2. Request Microphone
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      // 2. Setup Audio Contexts
+      // 3. Setup Audio Contexts
       if (!audioContextRef.current) {
         audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: INPUT_SAMPLE_RATE });
       }
@@ -59,15 +64,14 @@ const App: React.FC = () => {
         outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
       }
 
-      // Crucial: Resume contexts on user interaction
+      // Browsers require resumption after user gesture
       await audioContextRef.current.resume();
       await outputAudioContextRef.current.resume();
 
-      // 3. Initialize Gemini
+      // 4. Initialize Gemini Live Session
       const persona = PERSONAS[Math.floor(Math.random() * PERSONAS.length)];
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
-      // Connect to Live API
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
@@ -75,14 +79,14 @@ const App: React.FC = () => {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: persona.voice } }
           },
-          systemInstruction: `You are ${persona.name}. ${persona.instruction}. This is a random chat app called 'AnyOne'. Be warm, spontaneous, and keep the conversation flowing.`
+          systemInstruction: `Identity: ${persona.name}. Instruction: ${persona.instruction}. Context: This is AnyOne, a random voice chat app. Be friendly and engaging.`
         },
         callbacks: {
           onopen: () => {
-            console.log("Live connection opened");
+            console.log("AnyOne: Connection established");
             setAppState(AppState.CONNECTED);
             
-            // Start streaming audio from mic
+            // Connect mic to session
             const source = audioContextRef.current!.createMediaStreamSource(stream);
             const scriptProcessor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
             scriptProcessorRef.current = scriptProcessor;
@@ -90,23 +94,21 @@ const App: React.FC = () => {
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
               const pcmBlob = createPcmBlob(inputData);
-              // Send data only after session promise resolves
               sessionPromise.then((session) => {
                 session.sendRealtimeInput({ media: pcmBlob });
-              }).catch(() => {});
+              }).catch(err => console.error("Realtime input error:", err));
             };
 
             source.connect(scriptProcessor);
             scriptProcessor.connect(audioContextRef.current!.destination);
           },
           onmessage: async (message) => {
-            // Handle audio output
             const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (base64Audio && outputAudioContextRef.current) {
               const ctx = outputAudioContextRef.current;
               nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
               
-              const buffer = await decodeAudioData(decode(base64Audio), ctx, AUDIO_SAMPLE_RATE, 1);
+              const buffer = await decodePcmData(decode(base64Audio), ctx, AUDIO_SAMPLE_RATE, 1);
               const source = ctx.createBufferSource();
               source.buffer = buffer;
               source.connect(ctx.destination);
@@ -114,10 +116,9 @@ const App: React.FC = () => {
               
               source.start(nextStartTimeRef.current);
               nextStartTimeRef.current += buffer.duration;
-              sourcesRef.add(source);
+              sourcesRef.current.add(source);
             }
 
-            // Handle interruption
             if (message.serverContent?.interrupted) {
               sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
               sourcesRef.current.clear();
@@ -125,25 +126,27 @@ const App: React.FC = () => {
             }
           },
           onerror: (e) => {
-            console.error("Live Error Callback:", e);
-            setError("The connection was lost. Try again?");
+            console.error("Session Error Callback:", e);
+            setError("Connection error. The stranger might have left.");
             cleanup();
           },
-          onclose: () => {
-            console.log("Live connection closed");
+          onclose: (e) => {
+            console.log("Session Closed Callback:", e);
             cleanup();
           }
         }
       });
 
+      // Await connection to verify success
       sessionRef.current = await sessionPromise;
 
     } catch (err: any) {
-      console.error("Connection Failed:", err);
-      if (err.name === 'NotAllowedError') {
-        setError("Microphone permission is required.");
+      console.error("StartMatching Failure:", err);
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setError("Microphone permission denied.");
       } else {
-        setError("Failed to connect to the network. Please check your internet.");
+        // Detailed error for debugging
+        setError(`${err.message || "Failed to establish secure connection."}`);
       }
       cleanup();
     }
@@ -151,7 +154,6 @@ const App: React.FC = () => {
 
   return (
     <div className="h-screen w-screen flex flex-col items-center justify-center bg-slate-950 text-white overflow-hidden relative">
-      {/* Dynamic Themed Background */}
       <div className={`absolute inset-0 transition-all duration-1000 ease-in-out ${
         appState === AppState.CONNECTED ? 'bg-indigo-900/40 opacity-100 scale-105' : 
         appState === AppState.MATCHING ? 'bg-blue-900/20 opacity-100' : 
@@ -165,7 +167,7 @@ const App: React.FC = () => {
               <h1 className="text-7xl font-black tracking-tighter text-transparent bg-clip-text bg-gradient-to-br from-white via-white to-slate-500">
                 AnyOne
               </h1>
-              <p className="text-slate-400 text-lg font-medium opacity-80">One click to meet anyone.</p>
+              <p className="text-slate-400 text-lg font-medium opacity-80">Meet someone new instantly.</p>
             </div>
 
             <button
@@ -183,8 +185,9 @@ const App: React.FC = () => {
             </button>
 
             {error && (
-              <div className="px-5 py-3 bg-red-500/10 border border-red-500/20 rounded-2xl animate-in zoom-in-95 duration-300">
-                <p className="text-red-400 text-sm font-semibold">{error}</p>
+              <div className="px-5 py-3 bg-red-500/10 border border-red-500/20 rounded-2xl animate-in zoom-in-95 duration-300 max-w-xs">
+                <p className="text-red-400 text-xs font-bold uppercase tracking-tight mb-1">Error Encountered</p>
+                <p className="text-red-300 text-sm font-medium">{error}</p>
               </div>
             )}
           </>
@@ -200,8 +203,8 @@ const App: React.FC = () => {
                </div>
             </div>
             <div className="space-y-2">
-              <h2 className="text-3xl font-bold tracking-tight">Searching...</h2>
-              <p className="text-blue-400 font-medium animate-pulse uppercase tracking-widest text-xs">Finding a match</p>
+              <h2 className="text-3xl font-bold tracking-tight">Connecting...</h2>
+              <p className="text-blue-400 font-medium animate-pulse uppercase tracking-widest text-xs">Matching you now</p>
             </div>
             <button 
               onClick={cleanup}
@@ -220,7 +223,6 @@ const App: React.FC = () => {
                   <svg className="w-24 h-24 text-white/20" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                   </svg>
-                  {/* Wave effect when someone speaks */}
                   <div className="absolute inset-0 flex items-center justify-center gap-1.5 px-10">
                     {[...Array(5)].map((_, i) => (
                       <div 
@@ -236,7 +238,7 @@ const App: React.FC = () => {
                 <h2 className="text-3xl font-black">Connected!</h2>
                 <div className="inline-flex items-center gap-2 px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full">
                   <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                  <span className="text-green-400 text-xs font-bold uppercase tracking-wider">Live Voice</span>
+                  <span className="text-green-400 text-xs font-bold uppercase tracking-wider">Live Chat</span>
                 </div>
               </div>
             </div>
