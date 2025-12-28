@@ -9,5 +9,5 @@ export enum AppState {
 export interface Persona {
   name: string;
   instruction: string;
-  voice: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
+  voice: string;
 }
