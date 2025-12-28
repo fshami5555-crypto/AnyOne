@@ -2,6 +2,7 @@
   "name": "AnyOne",
   "description": "A fun, fast-paced app that connects you to a random companion for a voice conversation. Experience instant connections with smooth animations and high-quality audio.",
   "requestFramePermissions": [
-    "microphone"
+    "microphone",
+    "camera"
   ]
 }

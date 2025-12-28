@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Peer, { DataConnection } from 'peerjs';
 import { AppState } from './types.ts';
 
-const SLOT_PREFIX = 'anyone-v4-room-';
+const SLOT_PREFIX = 'anyone-v5-room-';
 const MAX_SLOTS = 5;
 const SCAN_TIMEOUT = 7000;
 
@@ -15,6 +15,8 @@ const App: React.FC = () => {
   // Call Stats
   const [elapsedTime, setElapsedTime] = useState(0);
   const [showChatButton, setShowChatButton] = useState(false);
+  const [showVideoButton, setShowVideoButton] = useState(false);
+  const [isVideoActive, setIsVideoActive] = useState(false);
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [messages, setMessages] = useState<{sender: 'me' | 'them', text: string}[]>([]);
   const [inputText, setInputText] = useState('');
@@ -24,6 +26,10 @@ const App: React.FC = () => {
   const callRef = useRef<any>(null);
   const dataConnRef = useRef<DataConnection | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+
   const scanTimerRef = useRef<number | null>(null);
   const intervalRef = useRef<number | null>(null);
 
@@ -44,15 +50,55 @@ const App: React.FC = () => {
     setStatusMsg('');
     setElapsedTime(0);
     setShowChatButton(false);
+    setShowVideoButton(false);
+    setIsVideoActive(false);
     setIsChatOpen(false);
     setMessages([]);
     setInputText('');
   }, []);
 
+  const enableVideo = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+      
+      // Update local stream
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach(t => t.stop());
+      }
+      localStreamRef.current = stream;
+      
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+
+      // Signal the other side to enable video
+      if (dataConnRef.current) {
+        dataConnRef.current.send({ type: 'SIGNAL_VIDEO_ENABLE' });
+      }
+
+      // Replace current call tracks if possible, or restart call
+      // For simplicity in this peerjs flow, we re-call with video
+      if (callRef.current && peerRef.current) {
+        const remotePeerId = callRef.current.peer;
+        callRef.current.close();
+        const newCall = peerRef.current.call(remotePeerId, stream);
+        handleCall(newCall);
+      }
+
+      setIsVideoActive(true);
+    } catch (e) {
+      setError("Camera permission denied");
+    }
+  };
+
   const setupDataConnection = (conn: DataConnection) => {
     dataConnRef.current = conn;
     conn.on('data', (data: any) => {
-      setMessages(prev => [...prev, { sender: 'them', text: String(data) }]);
+      if (typeof data === 'object' && data.type === 'SIGNAL_VIDEO_ENABLE') {
+        if (!isVideoActive) enableVideo();
+      } else {
+        setMessages(prev => [...prev, { sender: 'them', text: String(data) }]);
+      }
     });
     conn.on('close', cleanup);
   };
@@ -62,20 +108,31 @@ const App: React.FC = () => {
     callRef.current = call;
     
     call.on('stream', (remoteStream: MediaStream) => {
+      // If video tracks exist, set up video element
+      if (remoteStream.getVideoTracks().length > 0) {
+        setIsVideoActive(true);
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = remoteStream;
+        }
+      }
+
       if (!remoteAudioRef.current) remoteAudioRef.current = new Audio();
       remoteAudioRef.current.srcObject = remoteStream;
       remoteAudioRef.current.play().catch(console.error);
-      setAppState(AppState.CONNECTED);
       
-      // Start Timer
-      if (intervalRef.current) window.clearInterval(intervalRef.current);
-      intervalRef.current = window.setInterval(() => {
-        setElapsedTime(prev => {
-          const next = prev + 1;
-          if (next >= 60) setShowChatButton(true);
-          return next;
-        });
-      }, 1000);
+      if (appState !== AppState.CONNECTED) {
+        setAppState(AppState.CONNECTED);
+        // Start Timer only once
+        if (intervalRef.current) window.clearInterval(intervalRef.current);
+        intervalRef.current = window.setInterval(() => {
+          setElapsedTime(prev => {
+            const next = prev + 1;
+            if (next === 60) setShowChatButton(true);
+            if (next === 120) setShowVideoButton(true);
+            return next;
+          });
+        }, 1000);
+      }
     });
 
     call.on('close', cleanup);
@@ -130,7 +187,6 @@ const App: React.FC = () => {
       caller.on('open', () => {
         const call = caller.call(targetId, stream);
         handleCall(call);
-        // Also connect for data
         const conn = caller.connect(targetId);
         setupDataConnection(conn);
       });
@@ -156,8 +212,35 @@ const App: React.FC = () => {
 
   return (
     <div className="h-screen w-screen flex flex-col items-center justify-center bg-slate-950 text-white relative overflow-hidden">
-      {/* Background Glow */}
-      <div className={`absolute inset-0 transition-all duration-1000 ${appState === AppState.CONNECTED ? 'bg-indigo-600/10' : 'bg-transparent'}`} />
+      {/* Split Video Background */}
+      {isVideoActive && (
+        <div className="absolute inset-0 flex flex-col z-0">
+          <div className="flex-1 relative bg-black overflow-hidden border-b border-white/10">
+            <video 
+              ref={remoteVideoRef} 
+              autoPlay 
+              playsInline 
+              className="absolute inset-0 w-full h-full object-cover opacity-80"
+            />
+            <div className="absolute top-4 left-4 bg-black/40 px-3 py-1 rounded-full text-[10px] font-bold uppercase">Stranger</div>
+          </div>
+          <div className="flex-1 relative bg-black overflow-hidden">
+            <video 
+              ref={localVideoRef} 
+              autoPlay 
+              playsInline 
+              muted 
+              className="absolute inset-0 w-full h-full object-cover opacity-80"
+            />
+            <div className="absolute bottom-4 left-4 bg-black/40 px-3 py-1 rounded-full text-[10px] font-bold uppercase">You</div>
+          </div>
+        </div>
+      )}
+
+      {/* Background Glow (Audio mode) */}
+      {!isVideoActive && (
+        <div className={`absolute inset-0 transition-all duration-1000 ${appState === AppState.CONNECTED ? 'bg-indigo-600/10' : 'bg-transparent'}`} />
+      )}
 
       <div className="z-10 flex flex-col items-center gap-12 w-full max-w-sm text-center px-6">
         
@@ -166,7 +249,7 @@ const App: React.FC = () => {
             <h1 className="text-7xl font-black tracking-tighter mb-4 bg-clip-text text-transparent bg-gradient-to-b from-white to-slate-500">
               AnyOne
             </h1>
-            <p className="text-slate-400 font-medium mb-16 italic">Real people. Real talk.</p>
+            <p className="text-slate-400 font-medium mb-16 italic">Pure connection.</p>
             <button
               onClick={() => { setError(null); setAppState(AppState.MATCHING); startScanning(Math.floor(Math.random() * MAX_SLOTS) + 1); }}
               className="relative w-64 h-64 mx-auto flex items-center justify-center group"
@@ -189,7 +272,7 @@ const App: React.FC = () => {
               <div className="w-4 h-4 bg-blue-500 rounded-full animate-pulse" />
             </div>
             <div className="space-y-3">
-              <h2 className="text-3xl font-bold">Scanning...</h2>
+              <h2 className="text-3xl font-bold">Matching...</h2>
               <div className="px-4 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-full">
                 <p className="text-blue-400 text-[10px] font-black uppercase tracking-[0.2em]">{statusMsg}</p>
               </div>
@@ -199,39 +282,41 @@ const App: React.FC = () => {
         )}
 
         {appState === AppState.CONNECTED && (
-          <div className="flex flex-col items-center gap-12 animate-in fade-in duration-500 w-full">
+          <div className="flex flex-col items-center gap-12 animate-in fade-in duration-500 w-full drop-shadow-2xl">
             {/* Timer Display */}
-            <div className="text-3xl font-mono font-bold tracking-widest text-white/80 bg-white/5 px-6 py-2 rounded-full border border-white/10">
+            <div className="text-3xl font-mono font-bold tracking-widest text-white bg-black/50 backdrop-blur-md px-6 py-2 rounded-full border border-white/20">
               {formatTime(elapsedTime)}
             </div>
 
-            <div className="flex flex-col items-center gap-6">
-              <div className="w-56 h-56 rounded-full bg-indigo-600/10 flex items-center justify-center border-4 border-indigo-500/20 relative">
-                <div className="absolute inset-0 flex items-center justify-center gap-2">
-                  {[...Array(6)].map((_, i) => (
-                    <div 
-                      key={i} 
-                      className="w-2.5 bg-indigo-400 rounded-full animate-wave" 
-                      style={{ animationDelay: `${i * 0.15}s`, height: '30px' }} 
-                    />
-                  ))}
+            {!isVideoActive && (
+              <div className="flex flex-col items-center gap-6">
+                <div className="w-56 h-56 rounded-full bg-indigo-600/20 flex items-center justify-center border-4 border-indigo-500/30 relative backdrop-blur-sm">
+                  <div className="absolute inset-0 flex items-center justify-center gap-2">
+                    {[...Array(6)].map((_, i) => (
+                      <div 
+                        key={i} 
+                        className="w-2.5 bg-indigo-400 rounded-full animate-wave" 
+                        style={{ animationDelay: `${i * 0.15}s`, height: '30px' }} 
+                      />
+                    ))}
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  <h2 className="text-2xl font-black italic uppercase tracking-tighter">Live Voice</h2>
+                  <div className="inline-flex items-center gap-2 text-green-400 text-[10px] font-bold uppercase tracking-widest">
+                    <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+                    Audio Channel Open
+                  </div>
                 </div>
               </div>
-              <div className="space-y-1">
-                <h2 className="text-2xl font-black italic uppercase tracking-tighter">Connected</h2>
-                <div className="inline-flex items-center gap-2 text-green-400 text-[10px] font-bold uppercase tracking-widest">
-                  <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-                  Voice Active
-                </div>
-              </div>
-            </div>
+            )}
 
-            <div className="flex items-center gap-6">
-              {/* Chat Button (Visible after 60s) */}
+            <div className={`flex items-center gap-6 ${isVideoActive ? 'mt-auto pb-8' : ''}`}>
+              {/* Chat Button */}
               {showChatButton && (
                 <button
                   onClick={() => setIsChatOpen(true)}
-                  className="w-16 h-16 bg-white/10 rounded-full flex items-center justify-center border border-white/20 hover:bg-white/20 transition-all active:scale-90 relative"
+                  className="w-16 h-16 bg-black/60 backdrop-blur-md rounded-full flex items-center justify-center border border-white/20 hover:bg-white/10 transition-all active:scale-90 relative"
                 >
                   <svg className="w-7 h-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
@@ -251,71 +336,16 @@ const App: React.FC = () => {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M6 18L18 6M6 6l12 12" />
                 </svg>
               </button>
-            </div>
-          </div>
-        )}
-      </div>
 
-      {/* Chat Overlay */}
-      {isChatOpen && (
-        <div className="fixed inset-0 z-50 flex flex-col bg-slate-950 animate-in slide-in-from-bottom duration-300">
-          <div className="p-6 border-b border-white/10 flex justify-between items-center">
-            <h3 className="text-xl font-bold">Text Chat</h3>
-            <button onClick={() => setIsChatOpen(false)} className="p-2 hover:bg-white/10 rounded-full">
-              <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            </button>
-          </div>
-          
-          <div className="flex-1 overflow-y-auto p-6 space-y-4">
-            {messages.map((msg, idx) => (
-              <div key={idx} className={`flex ${msg.sender === 'me' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`max-w-[80%] px-4 py-2 rounded-2xl ${msg.sender === 'me' ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-white/10 text-slate-200 rounded-tl-none'}`}>
-                  {msg.text}
-                </div>
-              </div>
-            ))}
-            {messages.length === 0 && (
-              <p className="text-center text-slate-500 text-sm mt-10 italic">Start typing to talk privately...</p>
-            )}
-          </div>
-
-          <div className="p-6 border-t border-white/10 flex gap-3 pb-10">
-            <input 
-              type="text" 
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
-              placeholder="Type a message..."
-              className="flex-1 bg-white/5 border border-white/10 rounded-full px-5 py-3 focus:outline-none focus:border-indigo-500"
-            />
-            <button 
-              onClick={sendMessage}
-              className="w-12 h-12 bg-indigo-600 rounded-full flex items-center justify-center hover:bg-indigo-500 active:scale-90 transition-all"
-            >
-              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-              </svg>
-            </button>
-          </div>
-        </div>
-      )}
-
-      <style>{`
-        @keyframes wave {
-          0%, 100% { height: 30px; opacity: 0.4; }
-          50% { height: 90px; opacity: 1; }
-        }
-        .animate-wave { animation: wave 0.8s infinite ease-in-out; }
-        @keyframes radar {
-          0% { transform: scale(1); opacity: 0.6; }
-          100% { transform: scale(2.5); opacity: 0; }
-        }
-        .radar-wave { animation: radar 2s linear infinite; }
-      `}</style>
-    </div>
-  );
-};
-
-export default App;
+              {/* Video Button (Visible after 120s) */}
+              {showVideoButton && !isVideoActive && (
+                <button
+                  onClick={enableVideo}
+                  className="w-16 h-16 bg-indigo-600 rounded-full flex items-center justify-center border border-white/20 hover:bg-indigo-500 transition-all active:scale-90 animate-bounce"
+                  title="Reveal Camera"
+                >
+                  <svg className="w-8 h-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                </button>
+              )}
