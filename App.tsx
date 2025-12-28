@@ -10,27 +10,37 @@ const VAPI_PUBLIC_KEY = '519c8eaf-0de2-4e32-8baf-63296ad54042';
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [error, setError] = useState<string | null>(null);
+  const [isStrangerSpeaking, setIsStrangerSpeaking] = useState(false);
   const vapiRef = useRef<any>(null);
 
-  // Initialize Vapi on mount
   useEffect(() => {
+    // Initialize Vapi client
     const vapi = new Vapi(VAPI_PUBLIC_KEY);
     vapiRef.current = vapi;
 
     vapi.on('call-start', () => {
-      console.log('Vapi: Stranger connected');
+      console.log('Call started');
       setAppState(AppState.CONNECTED);
       setError(null);
     });
 
     vapi.on('call-end', () => {
-      console.log('Vapi: Call ended');
+      console.log('Call ended');
       setAppState(AppState.IDLE);
+      setIsStrangerSpeaking(false);
+    });
+
+    vapi.on('speech-start', () => {
+      setIsStrangerSpeaking(true);
+    });
+
+    vapi.on('speech-end', () => {
+      setIsStrangerSpeaking(false);
     });
 
     vapi.on('error', (err: any) => {
-      console.error('Vapi Error:', err);
-      setError('Connection failed. Stranger is unavailable.');
+      console.error('Vapi SDK Error:', err);
+      setError('Connection failed. Please check your microphone or try again.');
       setAppState(AppState.IDLE);
     });
 
@@ -44,6 +54,7 @@ const App: React.FC = () => {
       vapiRef.current.stop();
     }
     setAppState(AppState.IDLE);
+    setIsStrangerSpeaking(false);
   }, []);
 
   const startMatching = async () => {
@@ -51,44 +62,56 @@ const App: React.FC = () => {
       setError(null);
       setAppState(AppState.MATCHING);
 
-      // Randomly pick a stranger's persona
+      // Verify Microphone Access
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach(t => t.stop()); // Just checking permission
+      } catch (e) {
+        throw new Error("Microphone access denied. Please allow it to use AnyOne.");
+      }
+
+      // Pick a random persona
       const persona = PERSONAS[Math.floor(Math.random() * PERSONAS.length)];
 
-      // Configure the Vapi assistant dynamically
+      // Start Vapi Call with a "Transient Assistant"
       await vapiRef.current.start({
-        name: `Stranger - ${persona.name}`,
+        name: `AnyOne - ${persona.name}`,
         model: {
           provider: "openai",
           model: "gpt-4o-mini",
           messages: [
             {
               role: "system",
-              content: `Identity: ${persona.name}. Goal: You are a stranger on a voice chat app called 'AnyOne'. ${persona.instruction} Be friendly, keep responses brief and natural for voice conversation.`
+              content: `You are a stranger on a voice chat app called 'AnyOne'. ${persona.instruction} Be friendly, keep your responses concise, and act like a real person having a spontaneous chat.`
             }
-          ]
+          ],
+          temperature: 0.7,
         },
         voice: {
-          provider: "playht",
-          voiceId: "jennifer", // High-quality natural voice
+          provider: "openai",
+          voiceId: "shimmer", // Very reliable, high-quality female voice
         },
-        firstMessage: "Hi there! I'm so glad we connected. How's your day going?",
+        firstMessage: "Hey! I'm so happy we got matched. What's up?",
         transcriber: {
           provider: "deepgram",
           model: "nova-2",
           language: "en-US",
-        }
+        },
+        // Call settings
+        endCallFunctionEnabled: true,
+        fillersEnabled: true,
       });
 
     } catch (err: any) {
-      console.error("Vapi Match Failure:", err);
-      setError("Failed to find a match. Check your connection.");
+      console.error("Failed to start call:", err);
+      setError(err.message || "Could not connect. Please try again.");
       setAppState(AppState.IDLE);
     }
   };
 
   return (
     <div className="h-screen w-screen flex flex-col items-center justify-center bg-slate-950 text-white overflow-hidden relative">
-      {/* Background Ambience */}
+      {/* Dynamic Background */}
       <div className={`absolute inset-0 transition-all duration-1000 ease-in-out ${
         appState === AppState.CONNECTED ? 'bg-indigo-900/40 opacity-100 scale-105' : 
         appState === AppState.MATCHING ? 'bg-blue-900/20 opacity-100' : 
@@ -97,12 +120,12 @@ const App: React.FC = () => {
       
       <div className="z-10 flex flex-col items-center gap-12 px-8 text-center max-w-md w-full">
         {appState === AppState.IDLE && (
-          <>
+          <div className="flex flex-col items-center gap-12 w-full">
             <div className="space-y-3 animate-in fade-in slide-in-from-bottom-4 duration-700">
               <h1 className="text-7xl font-black tracking-tighter text-transparent bg-clip-text bg-gradient-to-br from-white via-white to-slate-500">
                 AnyOne
               </h1>
-              <p className="text-slate-400 text-lg font-medium opacity-80">Instant voice chat with strangers.</p>
+              <p className="text-slate-400 text-lg font-medium">Random Voice Chat</p>
             </div>
 
             <button
@@ -114,7 +137,6 @@ const App: React.FC = () => {
               <div className="absolute inset-0 border-2 border-white/5 rounded-full animate-ping-slow" />
               
               <div className="w-44 h-44 bg-white text-black rounded-full flex items-center justify-center font-black text-3xl shadow-2xl relative z-10 overflow-hidden">
-                <div className="absolute inset-0 bg-gradient-to-tr from-transparent via-black/5 to-transparent translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-700" />
                 AnyOne
               </div>
             </button>
@@ -124,7 +146,7 @@ const App: React.FC = () => {
                 <p className="text-red-400 text-sm font-semibold">{error}</p>
               </div>
             )}
-          </>
+          </div>
         )}
 
         {appState === AppState.MATCHING && (
@@ -138,7 +160,7 @@ const App: React.FC = () => {
             </div>
             <div className="space-y-2">
               <h2 className="text-3xl font-bold tracking-tight">Matching...</h2>
-              <p className="text-blue-400 font-medium animate-pulse uppercase tracking-widest text-xs">Finding a stranger</p>
+              <p className="text-blue-400 font-medium animate-pulse uppercase tracking-widest text-xs">Looking for a stranger</p>
             </div>
             <button 
               onClick={cleanup}
@@ -152,33 +174,32 @@ const App: React.FC = () => {
         {appState === AppState.CONNECTED && (
           <div className="flex flex-col items-center gap-12 w-full animate-in zoom-in-95 duration-500">
             <div className="flex flex-col items-center gap-6">
-              <div className="w-52 h-52 rounded-full p-1 bg-gradient-to-tr from-blue-500 via-purple-500 to-pink-500 shadow-2xl relative">
-                <div className="w-full h-full rounded-full bg-slate-950 flex items-center justify-center overflow-hidden">
-                  <div className="absolute inset-0 flex items-center justify-center gap-1.5 px-10">
-                    {[...Array(5)].map((_, i) => (
-                      <div 
-                        key={i} 
-                        className="w-2 bg-white/60 rounded-full animate-bar" 
-                        style={{ animationDelay: `${i * 0.1}s` }} 
-                      />
-                    ))}
-                  </div>
+              <div className={`w-52 h-52 rounded-full transition-all duration-300 ${isStrangerSpeaking ? 'scale-110 p-2 bg-blue-500 shadow-[0_0_40px_rgba(59,130,246,0.5)]' : 'p-1 bg-white/20'}`}>
+                <div className="w-full h-full rounded-full bg-slate-900 flex items-center justify-center overflow-hidden relative">
+                  {isStrangerSpeaking && (
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <div className="w-full h-full bg-blue-500/20 animate-pulse" />
+                    </div>
+                  )}
+                  <svg className={`w-24 h-24 ${isStrangerSpeaking ? 'text-blue-400' : 'text-white/20'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                  </svg>
                 </div>
               </div>
               <div className="space-y-2">
                 <h2 className="text-3xl font-black">Connected!</h2>
                 <div className="inline-flex items-center gap-2 px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full">
                   <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                  <span className="text-green-400 text-xs font-bold uppercase tracking-wider">Live Stranger</span>
+                  <span className="text-green-400 text-xs font-bold uppercase tracking-wider">Stranger is Live</span>
                 </div>
               </div>
             </div>
 
             <button
               onClick={cleanup}
-              className="w-24 h-24 flex items-center justify-center bg-red-600 hover:bg-red-500 rounded-full shadow-[0_10px_40px_rgba(220,38,38,0.3)] transition-all transform hover:scale-110 active:scale-95"
+              className="w-24 h-24 flex items-center justify-center bg-red-600 hover:bg-red-500 rounded-full shadow-[0_10px_40px_rgba(220,38,38,0.3)] transition-all transform hover:scale-110 active:scale-95 group"
             >
-              <svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <svg className="w-10 h-10 transform group-hover:rotate-90 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M6 18L18 6M6 6l12 12" />
               </svg>
             </button>
@@ -187,13 +208,6 @@ const App: React.FC = () => {
       </div>
 
       <style>{`
-        @keyframes bar {
-          0%, 100% { height: 10px; }
-          50% { height: 40px; }
-        }
-        .animate-bar {
-          animation: bar 0.6s infinite ease-in-out;
-        }
         @keyframes ping-slow {
           0% { transform: scale(1); opacity: 0.3; }
           100% { transform: scale(1.5); opacity: 0; }
