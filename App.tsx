@@ -21,7 +21,11 @@ const App: React.FC = () => {
 
   const cleanup = useCallback(() => {
     if (sessionRef.current) {
-      sessionRef.current.close();
+      try {
+        sessionRef.current.close();
+      } catch (e) {
+        console.debug("Error closing session", e);
+      }
       sessionRef.current = null;
     }
     if (streamRef.current) {
@@ -32,7 +36,11 @@ const App: React.FC = () => {
       scriptProcessorRef.current.disconnect();
       scriptProcessorRef.current = null;
     }
-    sourcesRef.current.forEach(source => source.stop());
+    sourcesRef.current.forEach(source => {
+      try {
+        source.stop();
+      } catch(e) {}
+    });
     sourcesRef.current.clear();
     nextStartTimeRef.current = 0;
     setAppState(AppState.IDLE);
@@ -40,14 +48,28 @@ const App: React.FC = () => {
 
   const startMatching = async () => {
     try {
-      setAppState(AppState.MATCHING);
       setError(null);
+      setAppState(AppState.MATCHING);
 
-      // Randomly pick a persona to simulate "anyone"
-      const persona = PERSONAS[Math.floor(Math.random() * PERSONAS.length)];
-      setCurrentPersona(persona);
+      // 1. Request Microphone first to isolate permission errors
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = stream;
+      } catch (micErr: any) {
+        console.error("Microphone Access Error:", micErr);
+        if (micErr.name === 'NotAllowedError' || micErr.name === 'PermissionDeniedError') {
+          setError("Microphone access was denied. Please check your browser settings.");
+        } else if (micErr.name === 'NotFoundError' || micErr.name === 'DevicesNotFoundError') {
+          setError("No microphone found on your device.");
+        } else {
+          setError("Could not access microphone. Please try again.");
+        }
+        setAppState(AppState.IDLE);
+        return;
+      }
 
-      // Initialize Audio Contexts
+      // 2. Initialize Audio Contexts and Ensure they are Resumed
       if (!audioContextRef.current) {
         audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: INPUT_SAMPLE_RATE });
       }
@@ -55,8 +77,13 @@ const App: React.FC = () => {
         outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
+      // Mandatory resume for browser compliance
+      await audioContextRef.current.resume();
+      await outputAudioContextRef.current.resume();
+
+      // 3. Connect to Gemini Live
+      const persona = PERSONAS[Math.floor(Math.random() * PERSONAS.length)];
+      setCurrentPersona(persona);
 
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
@@ -67,14 +94,14 @@ const App: React.FC = () => {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: persona.voice } }
           },
-          systemInstruction: `${persona.instruction}. You are talking on a random voice chat app called 'AnyOne'. Greet the user naturally when you hear them.`
+          systemInstruction: `You are ${persona.name}. ${persona.instruction}. You are talking on a random voice chat app called 'AnyOne'. Greet the user naturally when you hear them.`
         },
         callbacks: {
           onopen: () => {
-            console.log("Session Opened");
+            console.log("AnyOne Connection Established");
             setAppState(AppState.CONNECTED);
             
-            // Start streaming microphone
+            // Connect microphone stream to model
             const source = audioContextRef.current!.createMediaStreamSource(stream);
             const scriptProcessor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
             scriptProcessorRef.current = scriptProcessor;
@@ -83,7 +110,9 @@ const App: React.FC = () => {
               const inputData = e.inputBuffer.getChannelData(0);
               const pcmBlob = createPcmBlob(inputData);
               sessionPromise.then((session) => {
-                session.sendRealtimeInput({ media: pcmBlob });
+                if (session) session.sendRealtimeInput({ media: pcmBlob });
+              }).catch(err => {
+                console.error("Failed to send audio input", err);
               });
             };
 
@@ -94,35 +123,42 @@ const App: React.FC = () => {
             const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (base64Audio && outputAudioContextRef.current) {
               const ctx = outputAudioContextRef.current;
+              // Sync playback timing
               nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
               
-              const buffer = await decodeAudioData(decode(base64Audio), ctx, AUDIO_SAMPLE_RATE, 1);
-              const source = ctx.createBufferSource();
-              source.buffer = buffer;
-              source.connect(ctx.destination);
-              
-              source.onended = () => {
-                sourcesRef.current.delete(source);
-              };
-              
-              source.start(nextStartTimeRef.current);
-              nextStartTimeRef.current += buffer.duration;
-              sourcesRef.current.add(source);
+              try {
+                const buffer = await decodeAudioData(decode(base64Audio), ctx, AUDIO_SAMPLE_RATE, 1);
+                const source = ctx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(ctx.destination);
+                
+                source.onended = () => {
+                  sourcesRef.current.delete(source);
+                };
+                
+                source.start(nextStartTimeRef.current);
+                nextStartTimeRef.current += buffer.duration;
+                sourcesRef.current.add(source);
+              } catch (decodeErr) {
+                console.error("Audio decoding failed", decodeErr);
+              }
             }
 
             if (message.serverContent?.interrupted) {
-              sourcesRef.current.forEach(s => s.stop());
+              sourcesRef.current.forEach(s => {
+                try { s.stop(); } catch(e) {}
+              });
               sourcesRef.current.clear();
               nextStartTimeRef.current = 0;
             }
           },
           onerror: (e) => {
-            console.error("Live Error:", e);
-            setError("Connection failed. Please try again.");
+            console.error("Connection Error:", e);
+            setError("Connection lost. Let's try matching again.");
             cleanup();
           },
           onclose: () => {
-            console.log("Session Closed");
+            console.log("Connection closed.");
             cleanup();
           }
         }
@@ -130,10 +166,10 @@ const App: React.FC = () => {
 
       sessionRef.current = await sessionPromise;
 
-    } catch (err) {
-      console.error("Initialization Error:", err);
-      setError("Microphone access is required for AnyOne.");
-      setAppState(AppState.IDLE);
+    } catch (err: any) {
+      console.error("General Error:", err);
+      setError("Something went wrong connecting to AnyOne. Please try again.");
+      cleanup();
     }
   };
 
@@ -166,7 +202,11 @@ const App: React.FC = () => {
               AnyOne
             </button>
 
-            {error && <p className="text-red-400 font-medium animate-bounce">{error}</p>}
+            {error && (
+              <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl">
+                <p className="text-red-400 text-sm font-medium">{error}</p>
+              </div>
+            )}
           </>
         )}
 
