@@ -1,9 +1,9 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GoogleGenAI, Modality } from '@google/genai';
-import { AppState, Persona } from './types';
-import { PERSONAS, AUDIO_SAMPLE_RATE, INPUT_SAMPLE_RATE } from './constants';
-import { decode, decodeAudioData, createPcmBlob } from './services/audioService';
+import { AppState, Persona } from './types.ts';
+import { PERSONAS, AUDIO_SAMPLE_RATE, INPUT_SAMPLE_RATE } from './constants.ts';
+import { decode, decodeAudioData, createPcmBlob } from './services/audioService.ts';
 
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
