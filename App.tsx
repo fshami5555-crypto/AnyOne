@@ -1,44 +1,48 @@
 
-import React, { useState, useRef, useCallback } from 'react';
-import { GoogleGenAI, Modality } from '@google/genai';
-import { AppState, Persona } from './types.ts';
-import { PERSONAS, AUDIO_SAMPLE_RATE, INPUT_SAMPLE_RATE } from './constants.ts';
-import { decode, decodePcmData, createPcmBlob } from './services/audioService.ts';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import Vapi from '@vapi-ai/web';
+import { AppState } from './types.ts';
+import { PERSONAS } from './constants.ts';
+
+// Vapi Public Key provided by user
+const VAPI_PUBLIC_KEY = '519c8eaf-0de2-4e32-8baf-63296ad54042';
 
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [error, setError] = useState<string | null>(null);
-  
-  // Audio handling refs
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const outputAudioContextRef = useRef<AudioContext | null>(null);
-  const nextStartTimeRef = useRef<number>(0);
-  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
-  
-  // Connection and stream refs
-  const sessionRef = useRef<any>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const vapiRef = useRef<any>(null);
+
+  // Initialize Vapi on mount
+  useEffect(() => {
+    const vapi = new Vapi(VAPI_PUBLIC_KEY);
+    vapiRef.current = vapi;
+
+    vapi.on('call-start', () => {
+      console.log('Vapi: Stranger connected');
+      setAppState(AppState.CONNECTED);
+      setError(null);
+    });
+
+    vapi.on('call-end', () => {
+      console.log('Vapi: Call ended');
+      setAppState(AppState.IDLE);
+    });
+
+    vapi.on('error', (err: any) => {
+      console.error('Vapi Error:', err);
+      setError('Connection failed. Stranger is unavailable.');
+      setAppState(AppState.IDLE);
+    });
+
+    return () => {
+      vapi.stop();
+    };
+  }, []);
 
   const cleanup = useCallback(() => {
-    console.log("Cleanup initiated");
-    if (sessionRef.current) {
-      try { sessionRef.current.close(); } catch (e) {}
-      sessionRef.current = null;
+    if (vapiRef.current) {
+      vapiRef.current.stop();
     }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-    if (scriptProcessorRef.current) {
-      scriptProcessorRef.current.disconnect();
-      scriptProcessorRef.current = null;
-    }
-    sourcesRef.current.forEach(source => {
-      try { source.stop(); } catch(e) {}
-    });
-    sourcesRef.current.clear();
-    nextStartTimeRef.current = 0;
     setAppState(AppState.IDLE);
   }, []);
 
@@ -47,113 +51,44 @@ const App: React.FC = () => {
       setError(null);
       setAppState(AppState.MATCHING);
 
-      // 1. Check API Key
-      if (!process.env.API_KEY) {
-        throw new Error("API Key is missing. Please check your configuration.");
-      }
-
-      // 2. Request Microphone
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      // 3. Setup Audio Contexts
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: INPUT_SAMPLE_RATE });
-      }
-      if (!outputAudioContextRef.current) {
-        outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
-      }
-
-      // Browsers require resumption after user gesture
-      await audioContextRef.current.resume();
-      await outputAudioContextRef.current.resume();
-
-      // 4. Initialize Gemini Live Session
+      // Randomly pick a stranger's persona
       const persona = PERSONAS[Math.floor(Math.random() * PERSONAS.length)];
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      
-      const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: persona.voice } }
-          },
-          systemInstruction: `Identity: ${persona.name}. Instruction: ${persona.instruction}. Context: This is AnyOne, a random voice chat app. Be friendly and engaging.`
+
+      // Configure the Vapi assistant dynamically
+      await vapiRef.current.start({
+        name: `Stranger - ${persona.name}`,
+        model: {
+          provider: "openai",
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content: `Identity: ${persona.name}. Goal: You are a stranger on a voice chat app called 'AnyOne'. ${persona.instruction} Be friendly, keep responses brief and natural for voice conversation.`
+            }
+          ]
         },
-        callbacks: {
-          onopen: () => {
-            console.log("AnyOne: Connection established");
-            setAppState(AppState.CONNECTED);
-            
-            // Connect mic to session
-            const source = audioContextRef.current!.createMediaStreamSource(stream);
-            const scriptProcessor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
-            scriptProcessorRef.current = scriptProcessor;
-
-            scriptProcessor.onaudioprocess = (e) => {
-              const inputData = e.inputBuffer.getChannelData(0);
-              const pcmBlob = createPcmBlob(inputData);
-              sessionPromise.then((session) => {
-                session.sendRealtimeInput({ media: pcmBlob });
-              }).catch(err => console.error("Realtime input error:", err));
-            };
-
-            source.connect(scriptProcessor);
-            scriptProcessor.connect(audioContextRef.current!.destination);
-          },
-          onmessage: async (message) => {
-            const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (base64Audio && outputAudioContextRef.current) {
-              const ctx = outputAudioContextRef.current;
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-              
-              const buffer = await decodePcmData(decode(base64Audio), ctx, AUDIO_SAMPLE_RATE, 1);
-              const source = ctx.createBufferSource();
-              source.buffer = buffer;
-              source.connect(ctx.destination);
-              source.onended = () => sourcesRef.current.delete(source);
-              
-              source.start(nextStartTimeRef.current);
-              nextStartTimeRef.current += buffer.duration;
-              sourcesRef.current.add(source);
-            }
-
-            if (message.serverContent?.interrupted) {
-              sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
-              sourcesRef.current.clear();
-              nextStartTimeRef.current = 0;
-            }
-          },
-          onerror: (e) => {
-            console.error("Session Error Callback:", e);
-            setError("Connection error. The stranger might have left.");
-            cleanup();
-          },
-          onclose: (e) => {
-            console.log("Session Closed Callback:", e);
-            cleanup();
-          }
+        voice: {
+          provider: "playht",
+          voiceId: "jennifer", // High-quality natural voice
+        },
+        firstMessage: "Hi there! I'm so glad we connected. How's your day going?",
+        transcriber: {
+          provider: "deepgram",
+          model: "nova-2",
+          language: "en-US",
         }
       });
 
-      // Await connection to verify success
-      sessionRef.current = await sessionPromise;
-
     } catch (err: any) {
-      console.error("StartMatching Failure:", err);
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        setError("Microphone permission denied.");
-      } else {
-        // Detailed error for debugging
-        setError(`${err.message || "Failed to establish secure connection."}`);
-      }
-      cleanup();
+      console.error("Vapi Match Failure:", err);
+      setError("Failed to find a match. Check your connection.");
+      setAppState(AppState.IDLE);
     }
   };
 
   return (
     <div className="h-screen w-screen flex flex-col items-center justify-center bg-slate-950 text-white overflow-hidden relative">
+      {/* Background Ambience */}
       <div className={`absolute inset-0 transition-all duration-1000 ease-in-out ${
         appState === AppState.CONNECTED ? 'bg-indigo-900/40 opacity-100 scale-105' : 
         appState === AppState.MATCHING ? 'bg-blue-900/20 opacity-100' : 
@@ -167,7 +102,7 @@ const App: React.FC = () => {
               <h1 className="text-7xl font-black tracking-tighter text-transparent bg-clip-text bg-gradient-to-br from-white via-white to-slate-500">
                 AnyOne
               </h1>
-              <p className="text-slate-400 text-lg font-medium opacity-80">Meet someone new instantly.</p>
+              <p className="text-slate-400 text-lg font-medium opacity-80">Instant voice chat with strangers.</p>
             </div>
 
             <button
@@ -185,9 +120,8 @@ const App: React.FC = () => {
             </button>
 
             {error && (
-              <div className="px-5 py-3 bg-red-500/10 border border-red-500/20 rounded-2xl animate-in zoom-in-95 duration-300 max-w-xs">
-                <p className="text-red-400 text-xs font-bold uppercase tracking-tight mb-1">Error Encountered</p>
-                <p className="text-red-300 text-sm font-medium">{error}</p>
+              <div className="px-5 py-3 bg-red-500/10 border border-red-500/20 rounded-2xl animate-in zoom-in-95 duration-300">
+                <p className="text-red-400 text-sm font-semibold">{error}</p>
               </div>
             )}
           </>
@@ -203,8 +137,8 @@ const App: React.FC = () => {
                </div>
             </div>
             <div className="space-y-2">
-              <h2 className="text-3xl font-bold tracking-tight">Connecting...</h2>
-              <p className="text-blue-400 font-medium animate-pulse uppercase tracking-widest text-xs">Matching you now</p>
+              <h2 className="text-3xl font-bold tracking-tight">Matching...</h2>
+              <p className="text-blue-400 font-medium animate-pulse uppercase tracking-widest text-xs">Finding a stranger</p>
             </div>
             <button 
               onClick={cleanup}
@@ -220,9 +154,6 @@ const App: React.FC = () => {
             <div className="flex flex-col items-center gap-6">
               <div className="w-52 h-52 rounded-full p-1 bg-gradient-to-tr from-blue-500 via-purple-500 to-pink-500 shadow-2xl relative">
                 <div className="w-full h-full rounded-full bg-slate-950 flex items-center justify-center overflow-hidden">
-                  <svg className="w-24 h-24 text-white/20" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-                  </svg>
                   <div className="absolute inset-0 flex items-center justify-center gap-1.5 px-10">
                     {[...Array(5)].map((_, i) => (
                       <div 
@@ -238,7 +169,7 @@ const App: React.FC = () => {
                 <h2 className="text-3xl font-black">Connected!</h2>
                 <div className="inline-flex items-center gap-2 px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full">
                   <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                  <span className="text-green-400 text-xs font-bold uppercase tracking-wider">Live Chat</span>
+                  <span className="text-green-400 text-xs font-bold uppercase tracking-wider">Live Stranger</span>
                 </div>
               </div>
             </div>
