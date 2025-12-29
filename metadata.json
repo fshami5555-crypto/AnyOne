@@ -1,8 +1,7 @@
 {
   "requestFramePermissions": [
     "microphone",
-    "camera",
-    "geolocation"
+    "camera"
   ],
   "name": "",
   "description": ""

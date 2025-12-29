@@ -3,11 +3,21 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Peer, { DataConnection } from 'peerjs';
 import { AppState } from './types.ts';
 
-const APP_PREFIX = 'anyone-v8-';
-const CONNECT_TIMEOUT = 3500; // وقت قصير لاكتشاف المضيفين غير المستجيبين
+const APP_PREFIX = 'anyone-v9-';
+const CONNECT_TIMEOUT = 3000;
+const SLOTS_PER_LANGUAGE = 15; // عدد الغرف المتاحة لكل لغة لضمان سرعة الربط
+
+const LANGUAGES = [
+  { code: 'ar', name: 'العربية', flag: '🇸🇦' },
+  { code: 'en', name: 'English', flag: '🇺🇸' },
+  { code: 'fr', name: 'Français', flag: '🇫🇷' },
+  { code: 'es', name: 'Español', flag: '🇪🇸' },
+  { code: 'pt', name: 'Português', flag: '🇧🇷' },
+];
 
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
+  const [selectedLang, setSelectedLang] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string>('');
   
@@ -17,7 +27,6 @@ const App: React.FC = () => {
   const [messages, setMessages] = useState<{sender: 'me' | 'them', text: string}[]>([]);
   const [inputText, setInputText] = useState('');
   const [toast, setToast] = useState<{msg: string, target: 'chat' | 'video'} | null>(null);
-  const [coords, setCoords] = useState<{lat: number, lng: number} | null>(null);
 
   const isChatEnabled = elapsedTime >= 60;
   const isVideoEnabled = elapsedTime >= 120;
@@ -33,22 +42,13 @@ const App: React.FC = () => {
   const matchingTimeoutRef = useRef<number | null>(null);
   const intervalRef = useRef<number | null>(null);
 
-  // طلب الصلاحيات فوراً عند التحميل
   useEffect(() => {
     const initPermissions = async () => {
       try {
-        setStatusMsg('جاري الوصول للموقع...');
-        const position = await new Promise<GeolocationPosition>((resolve, reject) => {
-          navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 8000 });
-        });
-        setCoords({ lat: position.coords.latitude, lng: position.coords.longitude });
-
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
         stream.getTracks().forEach(t => t.stop());
-        
-        setStatusMsg('جاهز للاتصال');
       } catch (err) {
-        setError("يرجى تفعيل الموقع والكاميرا والميكروفون للمتابعة");
+        setError("يرجى تفعيل صلاحيات الكاميرا والميكروفون للمتابعة");
       }
     };
     initPermissions();
@@ -121,7 +121,7 @@ const App: React.FC = () => {
   const enableVideo = async (force: boolean = false) => {
     if (isVideoActive) return;
     if (!isVideoEnabled && !force) {
-      setToast({ msg: `متبقي ${120 - elapsedTime} ثانية`, target: 'video' });
+      setToast({ msg: `متبقي ${120 - elapsedTime} ثانية للفيديو`, target: 'video' });
       setTimeout(() => setToast(null), 2000);
       return;
     }
@@ -141,35 +141,24 @@ const App: React.FC = () => {
     } catch (e) { console.error(e); }
   };
 
-  // وظيفة الربط المحدثة
   const startMatching = async (retryCount: number = 0) => {
-    if (appState === AppState.CONNECTED) return;
-    if (!coords) {
-      setError("لم يتم تحديد موقعك بدقة");
-      return;
-    }
-
+    if (appState === AppState.CONNECTED || !selectedLang) return;
     if (peerRef.current) peerRef.current.destroy();
 
-    // نستخدم دقة 1.5 خانة عشرية لتقليل التصادم وزيادة دقة المنطقة
-    const zoneLat = coords.lat.toFixed(1);
-    const zoneLng = coords.lng.toFixed(1);
+    // اختيار غرفة عشوائية بناءً على اللغة
+    const slotIndex = Math.floor(Math.random() * SLOTS_PER_LANGUAGE) + 1;
+    const targetRoomId = `${APP_PREFIX}${selectedLang}-${slotIndex}`;
     
-    // التبديل بين محطتين A و B لتجنب المعرفات المعلقة
-    const slot = (retryCount % 2 === 0) ? 'A' : 'B';
-    const targetZoneId = `${APP_PREFIX}${zoneLat}-${zoneLng}-${slot}`;
-    
-    setStatusMsg(retryCount === 0 ? 'جاري البحث عن شخص قريب...' : `محاولة اتصال بديلة (${slot})...`);
+    setStatusMsg(`جاري البحث في غرف ${LANGUAGES.find(l => l.code === selectedLang)?.name}...`);
 
-    const peer = new Peer(targetZoneId, {
+    const peer = new Peer(targetRoomId, {
       config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
       debug: 1
     });
     peerRef.current = peer;
 
-    peer.on('open', (id) => {
-      // إذا نجح في حجز المعرف، يصبح هو "المستقبل" (Host)
-      setStatusMsg('في انتظار نداء شخص قريب منك...');
+    peer.on('open', () => {
+      setStatusMsg('في انتظار دخول شخص آخر...');
       peer.on('call', async (incomingCall) => {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         localStreamRef.current = stream;
@@ -178,15 +167,14 @@ const App: React.FC = () => {
       });
       peer.on('connection', setupDataConnection);
       
-      // إذا لم يتصل أحد خلال 6 ثوانٍ، نبدل الدور لنصبح نحن "المتصل"
-      matchingTimeoutRef.current = window.setTimeout(() => startMatching(retryCount + 1), 6000);
+      // إذا لم يدخل أحد، جرب غرفة أخرى لنفس اللغة
+      matchingTimeoutRef.current = window.setTimeout(() => startMatching(retryCount + 1), 5000);
     });
 
     peer.on('error', (err) => {
-      // إذا كان المعرف محجوزاً، نحن نصبح "المتصل" (Client)
       if (err.type === 'unavailable-id') {
         peer.destroy();
-        initiateCall(targetZoneId, retryCount);
+        initiateCall(targetRoomId, retryCount);
       } else {
         startMatching(retryCount + 1);
       }
@@ -197,10 +185,9 @@ const App: React.FC = () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       localStreamRef.current = stream;
-      const caller = new Peer(); // معرف عشوائي للمتصل
+      const caller = new Peer();
       peerRef.current = caller;
 
-      // إذا لم يرد المضيف خلال CONNECT_TIMEOUT ثانية، نفترض أنه معلق وننتقل للمحاولة التالية
       const failTimer = window.setTimeout(() => {
         if (appState !== AppState.CONNECTED) {
           caller.destroy();
@@ -223,6 +210,12 @@ const App: React.FC = () => {
     }
   };
 
+  const handleStart = (langCode: string) => {
+    setSelectedLang(langCode);
+    setAppState(AppState.MATCHING);
+    startMatching(0);
+  };
+
   const sendMessage = () => {
     if (!inputText.trim() || !dataConnRef.current) return;
     dataConnRef.current.send(inputText);
@@ -232,7 +225,7 @@ const App: React.FC = () => {
 
   return (
     <div className="h-screen w-screen flex flex-col items-center justify-center bg-slate-950 text-white relative overflow-hidden">
-      {/* Video Background */}
+      {/* Video Layers */}
       {isVideoActive && (
         <div className="absolute inset-0 flex flex-col z-0 animate-in fade-in duration-1000">
           <div className="flex-1 relative bg-black border-b border-white/5">
@@ -249,15 +242,28 @@ const App: React.FC = () => {
       {/* Main UI */}
       <div className="z-10 flex flex-col items-center w-full max-w-sm px-8 text-center">
         {appState === AppState.IDLE && (
-          <div className="animate-in fade-in slide-in-from-bottom-8 duration-700">
-            <h1 className="text-8xl font-black tracking-tighter mb-2 italic">AnyOne</h1>
-            <p className="text-slate-500 mb-12 font-medium">اتصال مباشر مع أشخاص حولك</p>
-            <button 
-              onClick={() => { setAppState(AppState.MATCHING); startMatching(0); }}
-              className="w-56 h-56 bg-white text-black rounded-full font-black text-2xl uppercase tracking-widest shadow-[0_0_60px_rgba(255,255,255,0.2)] active:scale-90 transition-all hover:scale-105"
-            >
-              Start
-            </button>
+          <div className="animate-in fade-in slide-in-from-bottom-8 duration-700 w-full">
+            <h1 className="text-7xl font-black tracking-tighter mb-2 italic bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-500">AnyOne</h1>
+            <p className="text-slate-500 mb-10 font-medium">اختر لغتك للبدء بالدردشة</p>
+            
+            <div className="grid grid-cols-1 gap-3 w-full">
+              {LANGUAGES.map((lang) => (
+                <button
+                  key={lang.code}
+                  onClick={() => handleStart(lang.code)}
+                  className="group relative flex items-center justify-between bg-white/5 border border-white/10 hover:border-white/40 hover:bg-white/10 px-6 py-4 rounded-2xl transition-all active:scale-95"
+                >
+                  <span className="text-2xl">{lang.flag}</span>
+                  <span className="font-bold text-lg">{lang.name}</span>
+                  <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center group-hover:bg-white/20">
+                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M9 5l7 7-7 7" />
+                    </svg>
+                  </div>
+                </button>
+              ))}
+            </div>
+
             {error && <p className="mt-8 text-red-500 text-sm font-bold bg-red-500/10 p-4 rounded-2xl border border-red-500/20">{error}</p>}
           </div>
         )}
@@ -268,13 +274,11 @@ const App: React.FC = () => {
               <div className="absolute inset-0 border-2 border-indigo-500 rounded-full animate-[ping_2s_infinite]" />
               <div className="absolute inset-0 border-2 border-indigo-400 rounded-full animate-[ping_3.5s_infinite]" />
               <div className="w-full h-full bg-indigo-600/10 rounded-full flex items-center justify-center border border-white/10 backdrop-blur-sm">
-                <div className="w-16 h-16 bg-indigo-500/20 rounded-full flex items-center justify-center">
-                  <div className="w-4 h-4 bg-indigo-500 rounded-full animate-pulse" />
-                </div>
+                <span className="text-5xl animate-pulse">{LANGUAGES.find(l => l.code === selectedLang)?.flag}</span>
               </div>
             </div>
             <div className="space-y-4">
-              <h2 className="text-3xl font-bold italic tracking-tight">Matching...</h2>
+              <h2 className="text-3xl font-bold italic tracking-tight">Searching...</h2>
               <div className="bg-white/5 border border-white/10 px-6 py-2 rounded-full inline-block">
                 <span className="text-indigo-400 text-[10px] font-black uppercase tracking-widest">{statusMsg}</span>
               </div>
@@ -291,23 +295,26 @@ const App: React.FC = () => {
 
             {!isVideoActive && (
               <div className="flex flex-col items-center gap-8 py-12">
-                <div className="w-48 h-48 rounded-full bg-indigo-500/10 border-4 border-indigo-500/30 flex items-center justify-center">
-                  <div className="flex gap-1.5 h-16 items-center">
+                <div className="w-48 h-48 rounded-full bg-indigo-500/10 border-4 border-indigo-500/30 flex items-center justify-center relative overflow-hidden">
+                  <div className="absolute inset-0 flex items-center justify-center opacity-20 text-8xl grayscale">
+                    {LANGUAGES.find(l => l.code === selectedLang)?.flag}
+                  </div>
+                  <div className="flex gap-1.5 h-16 items-center z-10">
                     {[...Array(5)].map((_, i) => (
-                      <div key={i} className="w-2 bg-indigo-500 rounded-full animate-wave" style={{ animationDelay: `${i * 0.1}s` }} />
+                      <div key={i} className="w-2 bg-white rounded-full animate-wave" style={{ animationDelay: `${i * 0.1}s` }} />
                     ))}
                   </div>
                 </div>
                 <div className="inline-flex items-center gap-2 text-green-400 text-xs font-black uppercase tracking-widest">
                   <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-                  تم الربط بنجاح
+                  Connected ({LANGUAGES.find(l => l.code === selectedLang)?.name})
                 </div>
               </div>
             )}
 
             <div className={`flex items-center gap-6 z-20 ${isVideoActive ? 'fixed bottom-10' : ''}`}>
               <button 
-                onClick={() => isChatEnabled ? setIsChatOpen(true) : setToast({msg: `متبقي ${60 - elapsedTime} ثانية`, target: 'chat'})}
+                onClick={() => isChatEnabled ? setIsChatOpen(true) : setToast({msg: `متبقي ${60 - elapsedTime} ثانية للدردشة`, target: 'chat'})}
                 className={`w-14 h-14 rounded-full flex items-center justify-center border transition-all ${isChatEnabled ? 'bg-white/10 border-white/20' : 'bg-white/5 border-transparent opacity-20 grayscale'}`}
               >
                 <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" strokeWidth={2} /></svg>
@@ -333,7 +340,7 @@ const App: React.FC = () => {
       {isChatOpen && (
         <div className="fixed inset-0 z-50 flex flex-col bg-slate-950 animate-in slide-in-from-bottom duration-300">
           <div className="p-6 border-b border-white/5 flex justify-between items-center bg-slate-900/50">
-            <h3 className="font-black italic tracking-tighter text-xl">محادثة خاصة</h3>
+            <h3 className="font-black italic tracking-tighter text-xl">Private Chat</h3>
             <button onClick={() => setIsChatOpen(false)} className="w-10 h-10 bg-white/5 rounded-full flex items-center justify-center">
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M6 18L18 6M6 6l12 12" strokeWidth={2} /></svg>
             </button>
