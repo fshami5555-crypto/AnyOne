@@ -19,9 +19,12 @@ const App: React.FC = () => {
   const [messages, setMessages] = useState<{sender: 'me' | 'them', text: string}[]>([]);
   const [inputText, setInputText] = useState('');
 
-  // Derived Visibility
-  const showChatButton = elapsedTime >= 60;
-  const showVideoButton = elapsedTime >= 120;
+  // Toast System
+  const [toast, setToast] = useState<{msg: string, target: 'chat' | 'video'} | null>(null);
+
+  // Activation Logic
+  const isChatEnabled = elapsedTime >= 60;
+  const isVideoEnabled = elapsedTime >= 120;
 
   const peerRef = useRef<Peer | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -34,6 +37,21 @@ const App: React.FC = () => {
 
   const scanTimerRef = useRef<number | null>(null);
   const intervalRef = useRef<number | null>(null);
+
+  // Request permissions immediately on mount
+  useEffect(() => {
+    const requestPermissions = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        // Stop the initial tracks to save battery/privacy until call starts
+        stream.getTracks().forEach(track => track.stop());
+        console.log("Permissions granted");
+      } catch (err) {
+        setError("يرجى تفعيل صلاحيات الكاميرا والميكروفون للمتابعة");
+      }
+    };
+    requestPermissions();
+  }, []);
 
   const cleanup = useCallback(() => {
     if (scanTimerRef.current) window.clearTimeout(scanTimerRef.current);
@@ -55,12 +73,28 @@ const App: React.FC = () => {
     setIsChatOpen(false);
     setMessages([]);
     setInputText('');
+    setToast(null);
   }, []);
 
+  const showToast = (target: 'chat' | 'video') => {
+    const remaining = target === 'chat' ? 60 - elapsedTime : 120 - elapsedTime;
+    const msg = `متبقي ${remaining} ثانية للتفعيل`;
+    setToast({ msg, target });
+    setTimeout(() => setToast(null), 2500);
+  };
+
   const enableVideo = async () => {
+    if (isVideoActive) return;
+    if (!isVideoEnabled) {
+      showToast('video');
+      return;
+    }
+
     try {
+      // Get combined stream
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
       
+      // Update local storage
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(t => t.stop());
       }
@@ -70,20 +104,23 @@ const App: React.FC = () => {
         localVideoRef.current.srcObject = stream;
       }
 
+      // Signal the peer to also open their video
       if (dataConnRef.current) {
         dataConnRef.current.send({ type: 'SIGNAL_VIDEO_ENABLE' });
       }
 
+      // Replace existing tracks in the ongoing call
       if (callRef.current && peerRef.current) {
         const remotePeerId = callRef.current.peer;
-        callRef.current.close();
+        // Re-call with video enabled
         const newCall = peerRef.current.call(remotePeerId, stream);
         handleCall(newCall);
       }
 
       setIsVideoActive(true);
     } catch (e) {
-      setError("Camera permission denied");
+      console.error("Camera Error:", e);
+      setError("فشل في الوصول إلى الكاميرا");
     }
   };
 
@@ -91,7 +128,13 @@ const App: React.FC = () => {
     dataConnRef.current = conn;
     conn.on('data', (data: any) => {
       if (typeof data === 'object' && data.type === 'SIGNAL_VIDEO_ENABLE') {
-        if (!isVideoActive) enableVideo();
+        if (!isVideoActive && isVideoEnabled) {
+          enableVideo();
+        } else if (!isVideoActive) {
+          // Force activation even if timer not reached if other side initiates
+          setElapsedTime(120); 
+          enableVideo();
+        }
       } else {
         setMessages(prev => [...prev, { sender: 'them', text: String(data) }]);
       }
@@ -104,16 +147,18 @@ const App: React.FC = () => {
     callRef.current = call;
     
     call.on('stream', (remoteStream: MediaStream) => {
+      // Audio logic
+      if (!remoteAudioRef.current) remoteAudioRef.current = new Audio();
+      remoteAudioRef.current.srcObject = remoteStream;
+      remoteAudioRef.current.play().catch(console.error);
+
+      // Video logic (only if stranger has video tracks)
       if (remoteStream.getVideoTracks().length > 0) {
         setIsVideoActive(true);
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = remoteStream;
         }
       }
-
-      if (!remoteAudioRef.current) remoteAudioRef.current = new Audio();
-      remoteAudioRef.current.srcObject = remoteStream;
-      remoteAudioRef.current.play().catch(console.error);
       
       if (appState !== AppState.CONNECTED) {
         setAppState(AppState.CONNECTED);
@@ -133,7 +178,7 @@ const App: React.FC = () => {
     if (peerRef.current) peerRef.current.destroy();
     
     const roomNumber = ((roomIndex - 1) % MAX_SLOTS) + 1;
-    setStatusMsg(`Checking Frequency ${roomNumber}...`);
+    setStatusMsg(`جاري البحث على التردد ${roomNumber}...`);
     const targetId = `${SLOT_PREFIX}${roomNumber}`;
     
     const peer = new Peer(targetId, {
@@ -142,12 +187,16 @@ const App: React.FC = () => {
     peerRef.current = peer;
 
     peer.on('open', () => {
-      setStatusMsg(`Waiting in Room ${roomNumber}...`);
+      setStatusMsg(`في انتظار وصول شخص للغرفة ${roomNumber}...`);
       peer.on('call', async (incomingCall) => {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        localStreamRef.current = stream;
-        incomingCall.answer(stream);
-        handleCall(incomingCall);
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          localStreamRef.current = stream;
+          incomingCall.answer(stream);
+          handleCall(incomingCall);
+        } catch (e) {
+          setError("يرجى تفعيل الميكروفون");
+        }
       });
       peer.on('connection', (conn) => {
         setupDataConnection(conn);
@@ -181,7 +230,7 @@ const App: React.FC = () => {
       });
       caller.on('error', cleanup);
     } catch (e) {
-      setError("Microphone access denied");
+      setError("صلاحيات الميكروفون مرفوضة");
       cleanup();
     }
   };
@@ -203,7 +252,7 @@ const App: React.FC = () => {
     <div className="h-screen w-screen flex flex-col items-center justify-center bg-slate-950 text-white relative overflow-hidden">
       {/* Split Video Background */}
       {isVideoActive && (
-        <div className="absolute inset-0 flex flex-col z-0">
+        <div className="absolute inset-0 flex flex-col z-0 animate-in fade-in duration-700">
           <div className="flex-1 relative bg-black overflow-hidden border-b border-white/10">
             <video 
               ref={remoteVideoRef} 
@@ -211,7 +260,7 @@ const App: React.FC = () => {
               playsInline 
               className="absolute inset-0 w-full h-full object-cover"
             />
-            <div className="absolute top-4 left-4 bg-black/60 px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest backdrop-blur-md">Stranger</div>
+            <div className="absolute top-4 left-4 bg-black/60 px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest backdrop-blur-md z-10">Stranger</div>
           </div>
           <div className="flex-1 relative bg-black overflow-hidden">
             <video 
@@ -221,12 +270,12 @@ const App: React.FC = () => {
               muted 
               className="absolute inset-0 w-full h-full object-cover"
             />
-            <div className="absolute bottom-4 left-4 bg-black/60 px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest backdrop-blur-md">You</div>
+            <div className="absolute bottom-4 left-4 bg-black/60 px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest backdrop-blur-md z-10">You</div>
           </div>
         </div>
       )}
 
-      {/* Background Glow (Audio mode) */}
+      {/* Background Glow */}
       {!isVideoActive && (
         <div className={`absolute inset-0 transition-all duration-1000 ${appState === AppState.CONNECTED ? 'bg-indigo-600/20' : 'bg-transparent'}`} />
       )}
@@ -238,7 +287,7 @@ const App: React.FC = () => {
             <h1 className="text-7xl font-black tracking-tighter mb-4 bg-clip-text text-transparent bg-gradient-to-b from-white to-slate-500">
               AnyOne
             </h1>
-            <p className="text-slate-400 font-medium mb-16 italic tracking-wide">Pure, anonymous connections.</p>
+            <p className="text-slate-400 font-medium mb-16 italic tracking-wide">Instant Human Connection.</p>
             <button
               onClick={() => { setError(null); setAppState(AppState.MATCHING); startScanning(Math.floor(Math.random() * MAX_SLOTS) + 1); }}
               className="relative w-64 h-64 mx-auto flex items-center justify-center group"
@@ -246,10 +295,10 @@ const App: React.FC = () => {
               <div className="absolute inset-0 bg-white/5 rounded-full blur-2xl group-hover:bg-white/10 transition-all" />
               <div className="absolute inset-0 border-2 border-white/10 rounded-full animate-[ping_4s_linear_infinite]" />
               <div className="w-52 h-52 bg-white text-black rounded-full flex items-center justify-center shadow-[0_0_50px_rgba(255,255,255,0.2)] active:scale-95 transition-transform">
-                <span className="text-3xl font-black uppercase tracking-widest">Start</span>
+                <span className="text-3xl font-black uppercase tracking-widest">Connect</span>
               </div>
             </button>
-            {error && <div className="mt-8 text-red-400 text-sm font-bold bg-red-500/10 p-3 rounded-lg">{error}</div>}
+            {error && <div className="mt-8 text-red-400 text-sm font-bold bg-red-500/10 p-3 rounded-lg border border-red-500/20">{error}</div>}
           </div>
         )}
 
@@ -261,19 +310,19 @@ const App: React.FC = () => {
               <div className="w-4 h-4 bg-indigo-500 rounded-full animate-pulse" />
             </div>
             <div className="space-y-3">
-              <h2 className="text-3xl font-bold tracking-tight">Searching...</h2>
+              <h2 className="text-3xl font-bold tracking-tight">Matching...</h2>
               <div className="px-4 py-1.5 bg-white/5 border border-white/10 rounded-full">
                 <p className="text-indigo-400 text-[10px] font-black uppercase tracking-[0.2em]">{statusMsg}</p>
               </div>
             </div>
-            <button onClick={cleanup} className="text-slate-500 hover:text-white text-sm font-bold transition-colors">Cancel</button>
+            <button onClick={cleanup} className="text-slate-500 hover:text-white text-sm font-bold transition-colors">إلغاء</button>
           </div>
         )}
 
         {appState === AppState.CONNECTED && (
-          <div className="flex flex-col items-center gap-12 animate-in fade-in duration-500 w-full">
+          <div className="flex flex-col items-center gap-12 animate-in fade-in duration-500 w-full h-full">
             {/* Timer Display */}
-            <div className="text-3xl font-mono font-bold tracking-widest text-white bg-black/40 backdrop-blur-xl px-8 py-3 rounded-full border border-white/20 shadow-2xl">
+            <div className="text-3xl font-mono font-bold tracking-widest text-white bg-black/40 backdrop-blur-xl px-8 py-3 rounded-full border border-white/20 shadow-2xl z-20">
               {formatTime(elapsedTime)}
             </div>
 
@@ -293,19 +342,25 @@ const App: React.FC = () => {
                 <div className="space-y-1">
                   <h2 className="text-2xl font-black italic uppercase tracking-tighter">Live Voice</h2>
                   <div className="inline-flex items-center gap-2 text-green-400 text-[10px] font-bold uppercase tracking-widest">
-                    <span className="w-2.5 h-2.5 bg-green-500 rounded-full animate-pulse shadow-[0_0_8px_#4ade80]" />
-                    Real-time
+                    <span className="w-2.5 h-2.5 bg-green-500 rounded-full animate-pulse shadow-[0_0_10px_#22c55e]" />
+                    متصل الآن
                   </div>
                 </div>
               </div>
             )}
 
-            <div className={`flex items-center gap-6 ${isVideoActive ? 'mt-auto pb-12' : ''}`}>
+            <div className={`flex items-center gap-6 z-20 ${isVideoActive ? 'fixed bottom-12' : ''}`}>
               {/* Chat Button */}
-              {showChatButton && (
+              <div className="relative">
+                {toast?.target === 'chat' && (
+                  <div className="absolute -top-12 left-1/2 -translate-x-1/2 bg-white text-black text-[10px] font-bold py-1.5 px-4 rounded-full whitespace-nowrap animate-in slide-in-from-bottom-2 shadow-xl z-30">
+                    <div className="absolute bottom-[-4px] left-1/2 -translate-x-1/2 w-2 h-2 bg-white rotate-45" />
+                    {toast.msg}
+                  </div>
+                )}
                 <button
-                  onClick={() => setIsChatOpen(true)}
-                  className="w-16 h-16 bg-white/10 backdrop-blur-md rounded-full flex items-center justify-center border border-white/20 hover:bg-white/20 transition-all active:scale-90 relative"
+                  onClick={() => isChatEnabled ? setIsChatOpen(true) : showToast('chat')}
+                  className={`w-16 h-16 rounded-full flex items-center justify-center border transition-all active:scale-90 relative ${isChatEnabled ? 'bg-white/10 border-white/20 hover:bg-white/20 shadow-lg' : 'bg-white/5 border-white/5 opacity-30 grayscale cursor-not-allowed'}`}
                 >
                   <svg className="w-7 h-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
@@ -314,7 +369,7 @@ const App: React.FC = () => {
                     <span className="absolute -top-1 -right-1 w-4 h-4 bg-indigo-500 rounded-full border-2 border-slate-950" />
                   )}
                 </button>
-              )}
+              </div>
 
               {/* End Call Button */}
               <button
@@ -326,18 +381,24 @@ const App: React.FC = () => {
                 </svg>
               </button>
 
-              {/* Video Button (Visible after 120s) */}
-              {showVideoButton && !isVideoActive && (
+              {/* Video Button */}
+              <div className="relative">
+                {toast?.target === 'video' && (
+                  <div className="absolute -top-12 left-1/2 -translate-x-1/2 bg-white text-black text-[10px] font-bold py-1.5 px-4 rounded-full whitespace-nowrap animate-in slide-in-from-bottom-2 shadow-xl z-30">
+                    <div className="absolute bottom-[-4px] left-1/2 -translate-x-1/2 w-2 h-2 bg-white rotate-45" />
+                    {toast.msg}
+                  </div>
+                )}
                 <button
                   onClick={enableVideo}
-                  className="w-16 h-16 bg-indigo-600 rounded-full flex items-center justify-center border border-white/20 hover:bg-indigo-500 transition-all active:scale-90 animate-pulse shadow-[0_0_20px_rgba(79,70,229,0.5)]"
+                  className={`w-16 h-16 rounded-full flex items-center justify-center border transition-all active:scale-90 shadow-2xl ${isVideoActive ? 'bg-green-600 border-green-400' : isVideoEnabled ? 'bg-indigo-600 border-indigo-400 animate-pulse' : 'bg-white/5 border-white/5 opacity-30 grayscale cursor-not-allowed'}`}
                   title="Reveal Camera"
                 >
                   <svg className="w-8 h-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
                   </svg>
                 </button>
-              )}
+              </div>
             </div>
           </div>
         )}
@@ -347,7 +408,7 @@ const App: React.FC = () => {
       {isChatOpen && (
         <div className="fixed inset-0 z-50 flex flex-col bg-slate-950/95 backdrop-blur-2xl animate-in slide-in-from-bottom duration-300">
           <div className="p-6 border-b border-white/10 flex justify-between items-center">
-            <h3 className="text-xl font-bold tracking-tight">Secure Chat</h3>
+            <h3 className="text-xl font-bold tracking-tight">محادثة خاصة</h3>
             <button onClick={() => setIsChatOpen(false)} className="p-2 hover:bg-white/10 rounded-full transition-colors">
               <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -371,7 +432,7 @@ const App: React.FC = () => {
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
-              placeholder="Send a secret..."
+              placeholder="اكتب رسالة..."
               className="flex-1 bg-white/5 border border-white/10 rounded-full px-6 py-3.5 focus:outline-none focus:border-indigo-500 transition-colors"
             />
             <button onClick={sendMessage} className="w-14 h-14 bg-indigo-600 rounded-full flex items-center justify-center hover:bg-indigo-500 active:scale-90 transition-all shadow-lg shadow-indigo-500/20">
