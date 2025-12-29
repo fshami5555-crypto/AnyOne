@@ -15,8 +15,20 @@ const LANGUAGES = [
   { code: 'pt', name: 'Português', flag: '🇧🇷' },
 ];
 
-const generateNumericId = () => {
-  return Math.floor(10000000 + Math.random() * 90000000).toString();
+/**
+ * دالة للحصول على المعرف الثابت للجهاز.
+ * تبحث في الذاكرة المحلية أولاً، وإذا لم تجد معرفاً تنشئ واحداً جديداً وتحفظه.
+ */
+const getPersistentNumericId = () => {
+  const storageKey = 'anyone_device_id';
+  let savedId = localStorage.getItem(storageKey);
+  
+  if (!savedId) {
+    savedId = Math.floor(10000000 + Math.random() * 90000000).toString();
+    localStorage.setItem(storageKey, savedId);
+  }
+  
+  return savedId;
 };
 
 const App: React.FC = () => {
@@ -50,7 +62,9 @@ const App: React.FC = () => {
   const timersRef = useRef<{ match?: number, session?: number }>({});
 
   useEffect(() => {
-    const numericId = generateNumericId();
+    // استخدام المعرف الثابت المحفوظ في الجهاز
+    const numericId = getPersistentNumericId();
+    
     const initPeer = () => {
       const peer = new Peer(numericId, {
         config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
@@ -90,7 +104,11 @@ const App: React.FC = () => {
 
       peer.on('error', (err) => {
         console.error("Peer error:", err);
-        if (err.type === 'peer-unavailable') {
+        // إذا كان الخطأ أن المعرف مستخدم بالفعل (نادراً ما يحدث مع المعرفات الثابتة إلا في حالة فتح نافذتين بنفس المعرف)
+        if (err.type === 'unavailable-id') {
+           setError("هذا المعرف مستخدم بالفعل في نافذة أخرى.");
+           setAppState(AppState.ERROR);
+        } else if (err.type === 'peer-unavailable') {
           setError("عذراً، المعرف الرقمي غير متاح حالياً");
           setAppState(AppState.ERROR);
         }
