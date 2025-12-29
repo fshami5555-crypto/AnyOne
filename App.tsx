@@ -15,10 +15,6 @@ const LANGUAGES = [
   { code: 'pt', name: 'Português', flag: '🇧🇷' },
 ];
 
-/**
- * دالة للحصول على المعرف الثابت للجهاز.
- * تبحث في الذاكرة المحلية أولاً، وإذا لم تجد معرفاً تنشئ واحداً جديداً وتحفظه.
- */
 const getPersistentNumericId = () => {
   const storageKey = 'anyone_device_id';
   let savedId = localStorage.getItem(storageKey);
@@ -44,7 +40,6 @@ const App: React.FC = () => {
   const [inputText, setInputText] = useState('');
   const [toast, setToast] = useState<string | null>(null);
   
-  // States for Dialer & ID
   const [myPeerId, setMyPeerId] = useState<string>('...');
   const [dialerValue, setDialerValue] = useState<string>('');
   const [isDialerOpen, setIsDialerOpen] = useState(false);
@@ -62,7 +57,6 @@ const App: React.FC = () => {
   const timersRef = useRef<{ match?: number, session?: number }>({});
 
   useEffect(() => {
-    // استخدام المعرف الثابت المحفوظ في الجهاز
     const numericId = getPersistentNumericId();
     
     const initPeer = () => {
@@ -76,40 +70,32 @@ const App: React.FC = () => {
       });
 
       peer.on('connection', (conn) => {
-        if (isBusy.current) {
-          conn.on('open', () => {
-            conn.send({ type: 'BUSY' });
-            setTimeout(() => conn.close(), 500);
-          });
-          return;
-        }
+        // نربط البيانات حتى لو كنا مشغولين لتمكين إرسال إشارة الفيديو
         setupDataConnection(conn);
       });
 
       peer.on('call', async (incomingCall) => {
-        if (isBusy.current) {
-          incomingCall.answer();
-          setTimeout(() => incomingCall.close(), 500);
-          return;
-        }
+        // إذا كنا في مكالمة بالفعل، نقوم بالرد تلقائياً لتحديث البث (ترقية لفيديو)
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const stream = await navigator.mediaDevices.getUserMedia({ 
+            audio: true, 
+            video: isVideoActive // الرد بنفس الحالة الحالية للمستخدم
+          });
           localStreamRef.current = stream;
           incomingCall.answer(stream);
           setupCall(incomingCall);
         } catch (e) {
-          console.error("Microphone error", e);
+          console.error("Call error", e);
         }
       });
 
       peer.on('error', (err) => {
         console.error("Peer error:", err);
-        // إذا كان الخطأ أن المعرف مستخدم بالفعل (نادراً ما يحدث مع المعرفات الثابتة إلا في حالة فتح نافذتين بنفس المعرف)
         if (err.type === 'unavailable-id') {
            setError("هذا المعرف مستخدم بالفعل في نافذة أخرى.");
            setAppState(AppState.ERROR);
         } else if (err.type === 'peer-unavailable') {
-          setError("عذراً، المعرف الرقمي غير متاح حالياً");
+          setError("عذراً، المعرف الرقمي غير متاح حالياً أو غير موجود");
           setAppState(AppState.ERROR);
         }
       });
@@ -119,7 +105,7 @@ const App: React.FC = () => {
     return () => {
       if (peerRef.current) peerRef.current.destroy();
     };
-  }, []);
+  }, [isVideoActive]);
 
   const cleanup = useCallback(() => {
     isBusy.current = false;
@@ -127,8 +113,14 @@ const App: React.FC = () => {
       if (typeof t === 'number') window.clearInterval(t);
     });
     
-    if (callRef.current) callRef.current.close();
-    if (dataConnRef.current) dataConnRef.current.close();
+    if (callRef.current) {
+      callRef.current.removeAllListeners();
+      callRef.current.close();
+    }
+    if (dataConnRef.current) {
+      dataConnRef.current.removeAllListeners();
+      dataConnRef.current.close();
+    }
     if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => t.stop());
     
     callRef.current = null;
@@ -152,7 +144,9 @@ const App: React.FC = () => {
     setAppState(AppState.CONNECTED);
     setIsDialerOpen(false);
     if (timersRef.current.match) window.clearInterval(timersRef.current.match);
-    timersRef.current.session = window.setInterval(() => setElapsedTime(prev => prev + 1), 1000);
+    if (!timersRef.current.session) {
+      timersRef.current.session = window.setInterval(() => setElapsedTime(prev => prev + 1), 1000);
+    }
   };
 
   const setupDataConnection = (conn: DataConnection) => {
@@ -168,21 +162,28 @@ const App: React.FC = () => {
       }
     });
     conn.on('close', cleanup);
-    conn.on('error', cleanup);
   };
 
   const setupCall = (call: any) => {
+    // إذا كان هناك مكالمة قديمة، نزيل المستمعات منها قبل استبدالها
+    if (callRef.current && callRef.current !== call) {
+      callRef.current.removeAllListeners();
+      callRef.current.close();
+    }
+
     callRef.current = call;
     call.on('stream', (remoteStream: MediaStream) => {
       if (!remoteAudioRef.current) remoteAudioRef.current = new Audio();
       remoteAudioRef.current.srcObject = remoteStream;
       remoteAudioRef.current.play().catch(() => {});
+
       if (remoteStream.getVideoTracks().length > 0) {
         setIsVideoActive(true);
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream;
       }
       onConnected();
     });
+
     call.on('close', cleanup);
     call.on('error', cleanup);
   };
@@ -200,6 +201,42 @@ const App: React.FC = () => {
     } catch (e) {
       cleanup();
       setError("يرجى تفعيل الميكروفون");
+    }
+  };
+
+  const toggleVideo = async () => {
+    // تقليل القيد الزمني للمساعدة في تجربة المستخدم
+    if (elapsedTime < 5 && !isVideoActive) {
+      setToast(`الفيديو متاح قريباً`);
+      setTimeout(() => setToast(null), 3000);
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: !isVideoActive });
+      localStreamRef.current = stream;
+      
+      if (!isVideoActive) {
+        // تفعيل الفيديو
+        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+        if (dataConnRef.current) dataConnRef.current.send({ type: 'VIDEO_SIGNAL' });
+        
+        // إعادة الاتصال بالبث الجديد (فيديو) مع تعطيل المستمعات القديمة لمنع cleanup
+        if (callRef.current && peerRef.current) {
+          const partnerId = callRef.current.peer;
+          const newCall = peerRef.current.call(partnerId, stream);
+          setupCall(newCall);
+        }
+        setIsVideoActive(true);
+      } else {
+        // تعطيل الفيديو (العودة للصوت فقط)
+        stream.getVideoTracks().forEach(t => t.stop());
+        setIsVideoActive(false);
+        // إشعار الطرف الآخر (اختياري، هنا سنعتمد على انقطاع البث)
+      }
+    } catch (e) { 
+      console.error(e);
+      setToast("فشل فتح الكاميرا - تأكد من إعطاء الصلاحية"); 
     }
   };
 
@@ -288,22 +325,6 @@ const App: React.FC = () => {
     setTimeout(() => startMatching(1), 200);
   };
 
-  const toggleVideo = async () => {
-    if (elapsedTime < 60 && !isVideoActive) {
-      setToast(`الفيديو متاح بعد ${60 - elapsedTime} ثانية`);
-      setTimeout(() => setToast(null), 3000);
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-      localStreamRef.current = stream;
-      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-      if (dataConnRef.current) dataConnRef.current.send({ type: 'VIDEO_SIGNAL' });
-      if (callRef.current && peerRef.current) setupCall(peerRef.current.call(callRef.current.peer, stream));
-      setIsVideoActive(true);
-    } catch (e) { setToast("فشل فتح الكاميرا"); }
-  };
-
   const sendMessage = () => {
     if (!inputText.trim() || !dataConnRef.current) return;
     dataConnRef.current.send(inputText);
@@ -328,7 +349,6 @@ const App: React.FC = () => {
   return (
     <div className="h-screen w-screen bg-[#020617] text-white flex flex-col items-center justify-center relative overflow-hidden font-sans">
       
-      {/* Top Status Bar */}
       <div className="fixed top-0 left-0 right-0 h-16 bg-slate-900/50 backdrop-blur-xl border-b border-white/10 flex items-center justify-between px-6 z-50">
         <div className="flex items-center gap-2">
           <div className="w-3 h-3 bg-green-500 rounded-full shadow-[0_0_10px_rgba(34,197,94,0.5)]" />
@@ -340,21 +360,19 @@ const App: React.FC = () => {
         </button>
       </div>
 
-      {/* Video Layer */}
       {isVideoActive && (
-        <div className="absolute inset-0 z-0 flex flex-col animate-in fade-in duration-700">
-          <div className="flex-1 relative bg-black">
+        <div className="absolute inset-0 z-0 flex flex-col animate-in fade-in duration-700 bg-black">
+          <div className="flex-1 relative">
             <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover" />
             <div className="absolute top-20 left-6 bg-black/60 backdrop-blur-md px-4 py-1 rounded-full text-[10px] font-bold border border-white/10 uppercase tracking-widest">Partner</div>
           </div>
-          <div className="flex-1 relative bg-black border-t border-white/10">
+          <div className="flex-1 relative border-t border-white/10">
             <video ref={localVideoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
             <div className="absolute bottom-32 left-6 bg-indigo-600/60 backdrop-blur-md px-4 py-1 rounded-full text-[10px] font-bold border border-white/10 uppercase tracking-widest">You</div>
           </div>
         </div>
       )}
 
-      {/* Main UI - Lang Select */}
       {appState === AppState.IDLE && (
         <div className="z-10 w-full max-w-md px-10 text-center animate-in slide-in-from-bottom-10 duration-700 overflow-y-auto no-scrollbar pb-24">
           <div className="mb-12 pt-12">
@@ -367,11 +385,7 @@ const App: React.FC = () => {
 
           <div className="space-y-4">
             {LANGUAGES.map(lang => (
-              <button 
-                key={lang.code} 
-                onClick={() => handleStart(lang.code)}
-                className="w-full group flex items-center justify-between bg-white/5 border border-white/10 hover:border-indigo-500 hover:bg-indigo-500/10 p-6 rounded-[2rem] transition-all active:scale-95"
-              >
+              <button key={lang.code} onClick={() => handleStart(lang.code)} className="w-full group flex items-center justify-between bg-white/5 border border-white/10 hover:border-indigo-500 hover:bg-indigo-500/10 p-6 rounded-[2rem] transition-all active:scale-95">
                 <div className="flex items-center gap-5">
                   <span className="text-5xl">{lang.flag}</span>
                   <span className="text-2xl font-bold">{lang.name}</span>
@@ -385,63 +399,44 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* Dialer Trigger - Floating Call Button */}
       {appState === AppState.IDLE && !isDialerOpen && (
-        <button 
-          onClick={() => setIsDialerOpen(true)}
-          className="fixed bottom-10 right-10 w-20 h-20 bg-green-600 rounded-full flex items-center justify-center shadow-[0_20px_40px_rgba(22,163,74,0.4)] hover:bg-green-500 active:scale-90 transition-all z-40 border-4 border-white/20"
-        >
+        <button onClick={() => setIsDialerOpen(true)} className="fixed bottom-10 right-10 w-20 h-20 bg-green-600 rounded-full flex items-center justify-center shadow-[0_20px_40px_rgba(22,163,74,0.4)] hover:bg-green-500 active:scale-90 transition-all z-40 border-4 border-white/20">
           <svg className="w-10 h-10 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M6.62 10.79a15.053 15.053 0 006.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"/></svg>
         </button>
       )}
 
-      {/* Dialer Pad Modal */}
       {isDialerOpen && (
         <div className="fixed inset-0 z-[100] bg-black/90 backdrop-blur-3xl flex flex-col animate-in slide-in-from-bottom duration-500">
           <div className="flex-1 flex flex-col items-center justify-center p-8">
             <button onClick={() => setIsDialerOpen(false)} className="absolute top-10 right-10 text-slate-500 hover:text-white">
                <svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M6 18L18 6M6 6l12 12" strokeWidth={2.5}/></svg>
             </button>
-            
             <div className="mb-12 text-center">
               <span className="text-xs font-black uppercase tracking-widest text-indigo-400 mb-4 block">اتصال مباشر بالمعرف</span>
               <div className="h-20 flex items-center justify-center">
                 <span className="text-6xl font-mono font-black tracking-widest text-white">{dialerValue || '--------'}</span>
               </div>
             </div>
-
             <div className="grid grid-cols-3 gap-6 max-w-xs w-full">
               {[1, 2, 3, 4, 5, 6, 7, 8, 9, '*', 0, '#'].map((n) => (
-                <button 
-                  key={n} 
-                  onClick={() => dial(n.toString())}
-                  className="w-20 h-20 rounded-full bg-white/5 border border-white/10 flex flex-col items-center justify-center hover:bg-white/10 active:bg-white/20 transition-all"
-                >
+                <button key={n} onClick={() => dial(n.toString())} className="w-20 h-20 rounded-full bg-white/5 border border-white/10 flex flex-col items-center justify-center hover:bg-white/10 active:bg-white/20 transition-all">
                   <span className="text-3xl font-bold">{n}</span>
                 </button>
               ))}
             </div>
-
             <div className="mt-12 flex gap-8 items-center">
               <button onClick={backspace} className="w-16 h-16 rounded-full flex items-center justify-center text-slate-500 hover:text-white">
                 <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M12 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2M3 12l6.41-6.41C9.77 5.22 10.19 5 10.64 5H20c1.1 0 2 .9 2 2v10c0 1.1-.9 2-2 2h-9.36c-.45 0-.87-.22-1.23-.59L3 12z" strokeWidth={2}/></svg>
               </button>
-              
-              <button 
-                onClick={handleDialerCall}
-                disabled={!dialerValue}
-                className="w-24 h-24 bg-green-600 rounded-full flex items-center justify-center shadow-2xl shadow-green-600/30 hover:bg-green-500 active:scale-90 transition-all disabled:opacity-30 disabled:grayscale"
-              >
+              <button onClick={handleDialerCall} disabled={!dialerValue} className="w-24 h-24 bg-green-600 rounded-full flex items-center justify-center shadow-2xl shadow-green-600/30 hover:bg-green-500 active:scale-90 transition-all disabled:opacity-30 disabled:grayscale">
                 <svg className="w-12 h-12 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M6.62 10.79a15.053 15.053 0 006.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"/></svg>
               </button>
-
-              <div className="w-16" /> {/* Placeholder for alignment */}
+              <div className="w-16" />
             </div>
           </div>
         </div>
       )}
 
-      {/* Matching State */}
       {appState === AppState.MATCHING && (
         <div className="z-10 flex flex-col items-center gap-14 text-center animate-in zoom-in-95">
           <div className="relative w-64 h-64 flex items-center justify-center">
@@ -460,7 +455,6 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* Connected State */}
       {appState === AppState.CONNECTED && (
         <div className="z-10 flex flex-col items-center justify-between w-full h-full py-24 px-8">
           <div className="bg-black/60 backdrop-blur-2xl border border-white/10 px-12 py-5 rounded-full text-5xl font-mono font-black text-indigo-400 shadow-2xl">
@@ -482,30 +476,19 @@ const App: React.FC = () => {
           )}
 
           <div className={`flex items-center gap-8 ${isVideoActive ? 'fixed bottom-10' : ''}`}>
-             <button 
-              onClick={() => elapsedTime >= 15 ? setIsChatOpen(true) : setToast(`الشات متاح قريباً`)}
-              className="w-18 h-18 rounded-full bg-white/10 border border-white/20 flex items-center justify-center hover:bg-white/20 transition-all shadow-xl"
-              style={{ width: '72px', height: '72px' }}
-             >
+             <button onClick={() => setIsChatOpen(true)} className="w-18 h-18 rounded-full bg-white/10 border border-white/20 flex items-center justify-center hover:bg-white/20 transition-all shadow-xl" style={{ width: '72px', height: '72px' }}>
                <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" strokeWidth={2.5}/></svg>
              </button>
-             
              <button onClick={cleanup} className="w-28 h-28 bg-red-600 rounded-full flex items-center justify-center shadow-2xl hover:bg-red-500 active:scale-90 transition-all border-4 border-white/10">
                <svg className="w-12 h-12 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M6 18L18 6M6 6l12 12" strokeWidth={5}/></svg>
              </button>
-
-             <button 
-              onClick={toggleVideo}
-              className={`w-18 h-18 rounded-full flex items-center justify-center border transition-all shadow-xl ${isVideoActive ? 'bg-green-600 border-green-400' : 'bg-white/10 border-white/20'}`}
-              style={{ width: '72px', height: '72px' }}
-             >
+             <button onClick={toggleVideo} className={`w-18 h-18 rounded-full flex items-center justify-center border transition-all shadow-xl ${isVideoActive ? 'bg-green-600 border-green-400' : 'bg-white/10 border-white/20'}`} style={{ width: '72px', height: '72px' }}>
                <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" strokeWidth={2.5}/></svg>
              </button>
           </div>
         </div>
       )}
 
-      {/* Error State */}
       {appState === AppState.ERROR && (
         <div className="z-10 flex flex-col items-center gap-10 text-center animate-in zoom-in-95">
           <div className="w-28 h-28 bg-red-500/10 rounded-full flex items-center justify-center border border-red-500/20">
@@ -519,7 +502,6 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* Chat Modal */}
       {isChatOpen && (
         <div className="fixed inset-0 z-[200] bg-[#020617] flex flex-col animate-in slide-in-from-bottom duration-400">
            <div className="p-8 border-b border-white/5 flex justify-between items-center bg-slate-900/40 backdrop-blur-3xl">
