@@ -3,10 +3,18 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Peer, { DataConnection } from 'peerjs';
 import { AppState } from './types.ts';
 
-const SLOT_PREFIX = 'anyone-v6-room-';
-const MAX_SLOTS = 8; // Increased slots for better distribution
-const SCAN_TIMEOUT = 5000; // Faster rotation
-const CONNECT_TIMEOUT = 5000; // Timeout if client fails to connect to host
+const APP_PREFIX = 'anyone-v7-';
+const SCAN_TIMEOUT = 5000;
+const CONNECT_TIMEOUT = 4000;
+
+// Helper to round coordinates for "Zone" matching
+const getZoneId = (lat: number, lng: number, offsetLat: number = 0, offsetLng: number = 0) => {
+  // Rounding to 1 decimal place gives a zone of roughly 11km x 11km
+  const precision = 1;
+  const zLat = (lat + offsetLat).toFixed(precision);
+  const zLng = (lng + offsetLng).toFixed(precision);
+  return `${APP_PREFIX}zone-${zLat}-${zLng}`;
+};
 
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
@@ -19,6 +27,7 @@ const App: React.FC = () => {
   const [messages, setMessages] = useState<{sender: 'me' | 'them', text: string}[]>([]);
   const [inputText, setInputText] = useState('');
   const [toast, setToast] = useState<{msg: string, target: 'chat' | 'video'} | null>(null);
+  const [coords, setCoords] = useState<{lat: number, lng: number} | null>(null);
 
   const isChatEnabled = elapsedTime >= 60;
   const isVideoEnabled = elapsedTime >= 120;
@@ -35,15 +44,28 @@ const App: React.FC = () => {
   const intervalRef = useRef<number | null>(null);
   const connectTimeoutRef = useRef<number | null>(null);
 
+  // Request all permissions immediately
   useEffect(() => {
-    const requestPermissions = async () => {
+    const initPermissions = async () => {
       try {
-        await navigator.mediaDevices.getUserMedia({ audio: true, video: true }).then(s => s.getTracks().forEach(t => t.stop()));
+        // Request Location
+        setStatusMsg('جاري تحديد موقعك...');
+        const position = await new Promise<GeolocationPosition>((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 10000 });
+        });
+        setCoords({ lat: position.coords.latitude, lng: position.coords.longitude });
+
+        // Request Media
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        stream.getTracks().forEach(t => t.stop());
+        
+        setStatusMsg('الصلاحيات مكتملة');
       } catch (err) {
-        setError("يرجى تفعيل صلاحيات الكاميرا والميكروفون");
+        console.error(err);
+        setError("يرجى تفعيل الموقع والكاميرا والميكروفون للمتابعة");
       }
     };
-    requestPermissions();
+    initPermissions();
   }, []);
 
   const cleanup = useCallback(() => {
@@ -72,12 +94,6 @@ const App: React.FC = () => {
     setInputText('');
     setToast(null);
   }, []);
-
-  const showToast = (target: 'chat' | 'video') => {
-    const remaining = target === 'chat' ? 60 - elapsedTime : 120 - elapsedTime;
-    setToast({ msg: `متبقي ${remaining} ثانية`, target });
-    setTimeout(() => setToast(null), 2000);
-  };
 
   const handleCall = (call: any) => {
     if (scanTimerRef.current) window.clearTimeout(scanTimerRef.current);
@@ -121,7 +137,9 @@ const App: React.FC = () => {
   const enableVideo = async (force: boolean = false) => {
     if (isVideoActive) return;
     if (!isVideoEnabled && !force) {
-      showToast('video');
+      const remaining = 120 - elapsedTime;
+      setToast({ msg: `متبقي ${remaining} ثانية`, target: 'video' });
+      setTimeout(() => setToast(null), 2000);
       return;
     }
 
@@ -144,25 +162,36 @@ const App: React.FC = () => {
     }
   };
 
-  const startScanning = async (roomIndex: number) => {
+  // Matching Logic based on Location Zones
+  const startMatching = async (step: number = 0) => {
     if (appState === AppState.CONNECTED) return;
+    if (!coords) {
+      setError("لم يتم تحديد الموقع بعد");
+      return;
+    }
+
     if (peerRef.current) {
       peerRef.current.removeAllListeners();
       peerRef.current.destroy();
     }
+
+    // Try current zone, then try expanding search to neighbors
+    const offsets = [
+      [0, 0], [0.1, 0], [-0.1, 0], [0, 0.1], [0, -0.1]
+    ];
+    const currentOffset = offsets[step % offsets.length];
+    const targetZoneId = getZoneId(coords.lat, coords.lng, currentOffset[0], currentOffset[1]);
     
-    const roomNumber = ((roomIndex - 1) % MAX_SLOTS) + 1;
-    setStatusMsg(`فحص المحطة ${roomNumber}...`);
-    const targetId = `${SLOT_PREFIX}${roomNumber}`;
+    setStatusMsg(step === 0 ? 'جاري البحث عن أشخاص بالقرب منك...' : `توسيع نطاق البحث (${step})...`);
     
-    const peer = new Peer(targetId, {
+    const peer = new Peer(targetZoneId, {
       config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
       debug: 1
     });
     peerRef.current = peer;
 
-    peer.on('open', () => {
-      setStatusMsg(`في انتظار مستخدم في المحطة ${roomNumber}...`);
+    peer.on('open', (id) => {
+      console.log('Listening on Zone ID:', id);
       peer.on('call', async (incomingCall) => {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         localStreamRef.current = stream;
@@ -170,29 +199,33 @@ const App: React.FC = () => {
         handleCall(incomingCall);
       });
       peer.on('connection', setupDataConnection);
-      scanTimerRef.current = window.setTimeout(() => startScanning(roomNumber + 1), SCAN_TIMEOUT);
+      
+      // If nobody calls us in 5s, rotate to next zone attempt
+      scanTimerRef.current = window.setTimeout(() => startMatching(step + 1), SCAN_TIMEOUT);
     });
 
     peer.on('error', (err) => {
       if (err.type === 'unavailable-id') {
-        initiateConnection(targetId, roomNumber);
+        // Someone is already "Host" of this zone, let's call them
+        peer.destroy();
+        initiateConnection(targetZoneId, step);
       } else {
-        startScanning(roomNumber + 1);
+        startMatching(step + 1);
       }
     });
   };
 
-  const initiateConnection = async (targetId: string, currentRoom: number) => {
+  const initiateConnection = async (targetId: string, step: number) => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       localStreamRef.current = stream;
-      const caller = new Peer();
+      const caller = new Peer(); // Random ID for caller
       peerRef.current = caller;
 
       connectTimeoutRef.current = window.setTimeout(() => {
         if (appState !== AppState.CONNECTED) {
           caller.destroy();
-          startScanning(currentRoom + 1);
+          startMatching(step + 1);
         }
       }, CONNECT_TIMEOUT);
 
@@ -203,7 +236,7 @@ const App: React.FC = () => {
         setupDataConnection(conn);
       });
 
-      caller.on('error', () => startScanning(currentRoom + 1));
+      caller.on('error', () => startMatching(step + 1));
     } catch (e) {
       cleanup();
     }
@@ -232,28 +265,31 @@ const App: React.FC = () => {
         </div>
       )}
 
-      {/* Matching/Idle UI */}
       <div className="z-10 flex flex-col items-center w-full max-w-sm px-8 text-center">
         {appState === AppState.IDLE && (
           <div className="animate-in fade-in slide-in-from-bottom-8 duration-700">
             <h1 className="text-8xl font-black tracking-tighter mb-2 italic">AnyOne</h1>
-            <p className="text-slate-500 mb-12 font-medium">Connect with a stranger instantly.</p>
+            <p className="text-slate-500 mb-12 font-medium">Connect with people near you.</p>
             <button 
-              onClick={() => { setAppState(AppState.MATCHING); startScanning(Math.floor(Math.random() * MAX_SLOTS) + 1); }}
+              onClick={() => { setAppState(AppState.MATCHING); startMatching(0); }}
               className="w-56 h-56 bg-white text-black rounded-full font-black text-2xl uppercase tracking-widest shadow-[0_0_60px_rgba(255,255,255,0.15)] active:scale-90 transition-all hover:scale-105"
             >
               Start
             </button>
+            {error && <p className="mt-8 text-red-500 text-sm font-bold bg-red-500/10 p-3 rounded-xl border border-red-500/20">{error}</p>}
           </div>
         )}
 
         {appState === AppState.MATCHING && (
           <div className="flex flex-col items-center gap-12 animate-in zoom-in-95">
-            <div className="relative w-40 h-40">
+            <div className="relative w-44 h-44">
               <div className="absolute inset-0 border-2 border-indigo-500 rounded-full animate-[ping_2s_infinite]" />
-              <div className="absolute inset-0 border-2 border-indigo-400 rounded-full animate-[ping_3s_infinite]" />
-              <div className="w-full h-full bg-indigo-600/20 rounded-full flex items-center justify-center">
-                <div className="w-4 h-4 bg-indigo-500 rounded-full animate-pulse" />
+              <div className="absolute inset-0 border-2 border-indigo-400 rounded-full animate-[ping_3.5s_infinite]" />
+              <div className="w-full h-full bg-indigo-600/10 rounded-full flex items-center justify-center border border-white/10 backdrop-blur-sm">
+                <svg className="w-12 h-12 text-indigo-500 animate-pulse" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
               </div>
             </div>
             <div className="space-y-4">
@@ -262,7 +298,7 @@ const App: React.FC = () => {
                 <span className="text-indigo-400 text-[10px] font-black uppercase tracking-widest">{statusMsg}</span>
               </div>
             </div>
-            <button onClick={cleanup} className="text-slate-500 font-bold hover:text-white transition-colors">Cancel Search</button>
+            <button onClick={cleanup} className="text-slate-500 font-bold hover:text-white transition-colors">Cancel</button>
           </div>
         )}
 
@@ -283,7 +319,7 @@ const App: React.FC = () => {
                 </div>
                 <div className="inline-flex items-center gap-2 text-green-400 text-xs font-black uppercase tracking-widest">
                   <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-                  Live Audio Room
+                  Connected Nearby
                 </div>
               </div>
             )}
@@ -297,7 +333,7 @@ const App: React.FC = () => {
                   </div>
                 )}
                 <button 
-                  onClick={() => isChatEnabled ? setIsChatOpen(true) : showToast('chat')}
+                  onClick={() => isChatEnabled ? setIsChatOpen(true) : setToast({msg: `متبقي ${60 - elapsedTime} ثانية`, target: 'chat'})}
                   className={`w-14 h-14 rounded-full flex items-center justify-center border transition-all ${isChatEnabled ? 'bg-white/10 border-white/20' : 'bg-white/5 border-transparent opacity-20 grayscale'}`}
                 >
                   <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
