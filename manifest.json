@@ -1,0 +1,17 @@
+
+{
+  "name": "AnyOne Real Chat",
+  "short_name": "AnyOne",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#020617",
+  "theme_color": "#4f46e5",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3616/3616215.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
