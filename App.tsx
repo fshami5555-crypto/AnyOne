@@ -1,17 +1,19 @@
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Peer, { DataConnection } from 'peerjs';
 import { AppState } from './types.ts';
 
-const APP_PREFIX = 'anyone-v10-';
-const FAST_TIMEOUT = 2500;
-const MAX_SEQUENTIAL_SLOTS = 10;
+const APP_PREFIX = 'anyone-v12-';
+const MATCH_TIMEOUT_LIMIT = 30; // 30 ثانية كحد أقصى
+const SLOT_PROBE_TIMEOUT = 2500; // وقت انتظار الرد من الغرفة قبل الانتقال للغرفة التالية
+const MAX_SEQUENTIAL_SLOTS = 20;
 
 const LANGUAGES = [
-  { code: 'ar', name: 'العربية', flag: '🇸🇦', baseCount: 42 },
-  { code: 'en', name: 'English', flag: '🇺🇸', baseCount: 128 },
-  { code: 'fr', name: 'Français', flag: '🇫🇷', baseCount: 35 },
-  { code: 'es', name: 'Español', flag: '🇪🇸', baseCount: 22 },
-  { code: 'pt', name: 'Português', flag: '🇧🇷', baseCount: 18 },
+  { code: 'ar', name: 'العربية', flag: '🇸🇦' },
+  { code: 'en', name: 'English', flag: '🇺🇸' },
+  { code: 'fr', name: 'Français', flag: '🇫🇷' },
+  { code: 'es', name: 'Español', flag: '🇪🇸' },
+  { code: 'pt', name: 'Português', flag: '🇧🇷' },
 ];
 
 const App: React.FC = () => {
@@ -19,7 +21,10 @@ const App: React.FC = () => {
   const [selectedLang, setSelectedLang] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string>('');
-  const [liveCounts, setLiveCounts] = useState<Record<string, number>>({});
+  const [matchTimer, setMatchTimer] = useState(MATCH_TIMEOUT_LIMIT);
+  const [liveCounts, setLiveCounts] = useState<Record<string, number>>({
+    ar: 0, en: 0, fr: 0, es: 0, pt: 0
+  });
   
   const [elapsedTime, setElapsedTime] = useState(0);
   const [isVideoActive, setIsVideoActive] = useState(false);
@@ -39,47 +44,30 @@ const App: React.FC = () => {
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
 
-  const matchingTimerRef = useRef<number | null>(null);
-  const intervalRef = useRef<number | null>(null);
+  const matchingIntervalRef = useRef<number | null>(null);
+  const callTimerRef = useRef<number | null>(null);
+  const sessionIntervalRef = useRef<number | null>(null);
 
-  // نظام محاكاة عدد المستخدمين المباشرين
+  // نظام فحص المستخدمين الحقيقيين (ديكور واجهة)
   useEffect(() => {
-    // تعيين الأرقام الأولية
-    const initial: Record<string, number> = {};
-    LANGUAGES.forEach(l => initial[l.code] = l.baseCount + Math.floor(Math.random() * 10));
-    setLiveCounts(initial);
-
-    // تحديث الأرقام كل 5 ثوانٍ بشكل عشوائي طفيف
-    const countInterval = setInterval(() => {
+    const simulateLive = () => {
       setLiveCounts(prev => {
         const next = { ...prev };
-        Object.keys(next).forEach(code => {
-          const change = Math.random() > 0.5 ? 1 : -1;
-          next[code] = Math.max(5, next[code] + (Math.random() > 0.7 ? change : 0));
+        LANGUAGES.forEach(l => {
+          next[l.code] = Math.max(2, (prev[l.code] || 10) + (Math.random() > 0.5 ? 1 : -1));
         });
         return next;
       });
-    }, 5000);
-
-    return () => clearInterval(countInterval);
-  }, []);
-
-  useEffect(() => {
-    const initPermissions = async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-        stream.getTracks().forEach(t => t.stop());
-      } catch (err) {
-        setError("يرجى تفعيل صلاحيات الكاميرا والميكروفون للمتابعة");
-      }
     };
-    initPermissions();
+    simulateLive();
+    const inv = setInterval(simulateLive, 10000);
+    return () => clearInterval(inv);
   }, []);
 
   const cleanup = useCallback(() => {
-    // FIX: Corrected variable name from matchingTimeoutRef to matchingTimerRef
-    if (matchingTimerRef.current) window.clearTimeout(matchingTimerRef.current);
-    if (intervalRef.current) window.clearInterval(intervalRef.current);
+    if (matchingIntervalRef.current) window.clearInterval(matchingIntervalRef.current);
+    if (callTimerRef.current) window.clearTimeout(callTimerRef.current);
+    if (sessionIntervalRef.current) window.clearInterval(sessionIntervalRef.current);
     
     if (callRef.current) callRef.current.close();
     if (dataConnRef.current) dataConnRef.current.close();
@@ -96,6 +84,7 @@ const App: React.FC = () => {
     setAppState(AppState.IDLE);
     setStatusMsg('');
     setElapsedTime(0);
+    setMatchTimer(MATCH_TIMEOUT_LIMIT);
     setIsVideoActive(false);
     setIsChatOpen(false);
     setMessages([]);
@@ -104,8 +93,13 @@ const App: React.FC = () => {
   }, []);
 
   const handleCall = (call: any) => {
-    // FIX: Corrected variable name from matchingTimeoutRef to matchingTimerRef
-    if (matchingTimerRef.current) window.clearTimeout(matchingTimerRef.current);
+    // إذا كنت مضيفاً وبالفعل لديك مكالمة، ارفض المكالمات الجديدة
+    if (callRef.current && callRef.current.open) {
+      call.close();
+      return;
+    }
+
+    if (callTimerRef.current) window.clearTimeout(callTimerRef.current);
     callRef.current = call;
     
     call.on('stream', (remoteStream: MediaStream) => {
@@ -120,8 +114,8 @@ const App: React.FC = () => {
       
       if (appState !== AppState.CONNECTED) {
         setAppState(AppState.CONNECTED);
-        if (intervalRef.current) window.clearInterval(intervalRef.current);
-        intervalRef.current = window.setInterval(() => setElapsedTime(prev => prev + 1), 1000);
+        if (sessionIntervalRef.current) window.clearInterval(sessionIntervalRef.current);
+        sessionIntervalRef.current = window.setInterval(() => setElapsedTime(prev => prev + 1), 1000);
       }
     });
 
@@ -130,44 +124,30 @@ const App: React.FC = () => {
   };
 
   const setupDataConnection = (conn: DataConnection) => {
+    // إذا كنت مضيفاً وبالفعل لديك اتصال، ارفض الجديد
+    if (dataConnRef.current && dataConnRef.current.open) {
+      conn.close();
+      return;
+    }
     dataConnRef.current = conn;
     conn.on('data', (data: any) => {
-      if (data?.type === 'SIGNAL_VIDEO_ENABLE') {
-        enableVideo(true);
-      } else {
-        setMessages(prev => [...prev, { sender: 'them', text: String(data) }]);
-      }
+      if (data?.type === 'SIGNAL_VIDEO_ENABLE') enableVideo(true);
+      else setMessages(prev => [...prev, { sender: 'them', text: String(data) }]);
     });
     conn.on('close', cleanup);
     conn.on('error', cleanup);
   };
 
-  const enableVideo = async (force: boolean = false) => {
-    if (isVideoActive) return;
-    if (!isVideoEnabled && !force) {
-      setToast({ msg: `متبقي ${120 - elapsedTime} ثانية للفيديو`, target: 'video' });
-      setTimeout(() => setToast(null), 2000);
+  const startMatchingSequence = async (slotIndex: number = 1) => {
+    if (appState === AppState.CONNECTED || !selectedLang) return;
+    
+    // إذا انتهى مؤقت الـ 30 ثانية
+    if (matchTimer <= 0) {
+      setAppState(AppState.ERROR);
+      setError("لم يتم العثور على أحد حالياً. حاول مرة أخرى.");
       return;
     }
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-      if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => t.stop());
-      localStreamRef.current = stream;
-      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-      if (dataConnRef.current && !force) dataConnRef.current.send({ type: 'SIGNAL_VIDEO_ENABLE' });
-
-      if (callRef.current && peerRef.current) {
-        const remoteId = callRef.current.peer;
-        handleCall(peerRef.current.call(remoteId, stream));
-      }
-      setIsVideoActive(true);
-    } catch (e) { console.error(e); }
-  };
-
-  const startMatching = async (slotIndex: number = 1) => {
-    if (appState === AppState.CONNECTED || !selectedLang) return;
-    
     const currentSlot = slotIndex > MAX_SEQUENTIAL_SLOTS ? 1 : slotIndex;
     const targetRoomId = `${APP_PREFIX}${selectedLang}-slot-${currentSlot}`;
     
@@ -176,7 +156,7 @@ const App: React.FC = () => {
       peerRef.current.destroy();
     }
 
-    setStatusMsg(`فحص القناة ${currentSlot}...`);
+    setStatusMsg(`جاري فحص القناة ${currentSlot}...`);
 
     const peer = new Peer(targetRoomId, {
       config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
@@ -185,7 +165,8 @@ const App: React.FC = () => {
     peerRef.current = peer;
 
     peer.on('open', () => {
-      setStatusMsg('في انتظار دخول شخص آخر...');
+      // نجحت في أن تكون مضيفاً (Host) لهذه الغرفة
+      setStatusMsg('أنت الآن المضيف.. بانتظار شريك...');
       peer.on('call', async (incomingCall) => {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         localStreamRef.current = stream;
@@ -193,32 +174,38 @@ const App: React.FC = () => {
         handleCall(incomingCall);
       });
       peer.on('connection', setupDataConnection);
-      matchingTimerRef.current = window.setTimeout(() => startMatching(currentSlot + 1), 6000);
+      
+      // ابقَ مضيفاً حتى ينتهي الوقت أو يأتي أحد
     });
 
     peer.on('error', (err) => {
       if (err.type === 'unavailable-id') {
+        // الغرفة مأخوذة، حاول الاتصال بصاحبها (كن الضيف)
         peer.destroy();
-        initiateCall(targetRoomId, currentSlot);
+        attemptToJoin(targetRoomId, currentSlot);
       } else {
-        startMatching(currentSlot + 1);
+        // خطأ تقني، انتقل للقناة التالية
+        startMatchingSequence(currentSlot + 1);
       }
     });
   };
 
-  const initiateCall = async (targetId: string, currentSlot: number) => {
+  const attemptToJoin = async (targetId: string, currentSlot: number) => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       localStreamRef.current = stream;
       const caller = new Peer();
       peerRef.current = caller;
 
+      setStatusMsg(`الغرفة ${currentSlot} ممتلئة.. نطلب الانضمام...`);
+
+      // إذا لم يرد المضيف خلال وقت القنص، نعتبر الغرفة مشغولة تماماً وننتقل للي بعدها
       const failTimer = window.setTimeout(() => {
         if (appState !== AppState.CONNECTED) {
           caller.destroy();
-          startMatching(currentSlot + 1);
+          startMatchingSequence(currentSlot + 1);
         }
-      }, FAST_TIMEOUT);
+      }, SLOT_PROBE_TIMEOUT);
 
       caller.on('open', () => {
         const call = caller.call(targetId, stream);
@@ -228,7 +215,7 @@ const App: React.FC = () => {
 
       caller.on('error', () => {
         window.clearTimeout(failTimer);
-        startMatching(currentSlot + 1);
+        startMatchingSequence(currentSlot + 1);
       });
     } catch (e) {
       cleanup();
@@ -238,7 +225,41 @@ const App: React.FC = () => {
   const handleStart = (langCode: string) => {
     setSelectedLang(langCode);
     setAppState(AppState.MATCHING);
-    startMatching(1);
+    setMatchTimer(MATCH_TIMEOUT_LIMIT);
+    
+    // ابدأ مؤقت الـ 30 ثانية
+    if (matchingIntervalRef.current) window.clearInterval(matchingIntervalRef.current);
+    matchingIntervalRef.current = window.setInterval(() => {
+      setMatchTimer(prev => {
+        if (prev <= 1) {
+          window.clearInterval(matchingIntervalRef.current!);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    startMatchingSequence(1);
+  };
+
+  const enableVideo = async (force: boolean = false) => {
+    if (isVideoActive) return;
+    if (!isVideoEnabled && !force) {
+      setToast({ msg: `متبقي ${120 - elapsedTime} ثانية للفيديو`, target: 'video' });
+      setTimeout(() => setToast(null), 2000);
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+      if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => t.stop());
+      localStreamRef.current = stream;
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      if (dataConnRef.current && !force) dataConnRef.current.send({ type: 'SIGNAL_VIDEO_ENABLE' });
+      if (callRef.current && peerRef.current) {
+        handleCall(peerRef.current.call(callRef.current.peer, stream));
+      }
+      setIsVideoActive(true);
+    } catch (e) { console.error(e); }
   };
 
   const sendMessage = () => {
@@ -269,7 +290,7 @@ const App: React.FC = () => {
         {appState === AppState.IDLE && (
           <div className="animate-in fade-in slide-in-from-bottom-8 duration-700 w-full">
             <h1 className="text-8xl font-black tracking-tighter mb-2 italic text-white drop-shadow-2xl">AnyOne</h1>
-            <p className="text-slate-400 mb-8 font-medium">اتصال مباشر.. صوت وصورة</p>
+            <p className="text-slate-400 mb-8 font-medium italic">اتصال حقيقي بناءً على اللغة</p>
             
             <div className="grid grid-cols-1 gap-3 w-full">
               {LANGUAGES.map((lang) => (
@@ -301,27 +322,52 @@ const App: React.FC = () => {
                 </button>
               ))}
             </div>
-
-            {error && <p className="mt-8 text-red-500 text-sm font-bold bg-red-500/10 p-4 rounded-2xl border border-red-500/20">{error}</p>}
           </div>
         )}
 
         {appState === AppState.MATCHING && (
           <div className="flex flex-col items-center gap-12 animate-in zoom-in-95">
-            <div className="relative w-48 h-48">
-              <div className="absolute inset-0 border-2 border-indigo-500/30 rounded-full animate-[ping_2s_infinite]" />
-              <div className="absolute inset-0 border-2 border-indigo-400/20 rounded-full animate-[ping_3.5s_infinite]" />
-              <div className="w-full h-full bg-indigo-600/5 rounded-full flex items-center justify-center border border-white/10 backdrop-blur-xl">
-                <span className="text-6xl animate-pulse drop-shadow-2xl">{LANGUAGES.find(l => l.code === selectedLang)?.flag}</span>
-              </div>
+            <div className="relative w-48 h-48 flex items-center justify-center">
+               {/* Progress Ring */}
+               <svg className="absolute inset-0 w-full h-full -rotate-90">
+                  <circle cx="96" cy="96" r="88" stroke="currentColor" strokeWidth="4" fill="transparent" className="text-white/5" />
+                  <circle cx="96" cy="96" r="88" stroke="currentColor" strokeWidth="4" fill="transparent" 
+                    className="text-indigo-500 transition-all duration-1000"
+                    strokeDasharray={552.92}
+                    strokeDashoffset={552.92 - (552.92 * matchTimer) / MATCH_TIMEOUT_LIMIT}
+                  />
+               </svg>
+               <div className="flex flex-col items-center z-10">
+                  <span className="text-6xl font-black italic">{matchTimer}</span>
+                  <span className="text-[10px] uppercase font-bold tracking-widest text-slate-400">Sec Left</span>
+               </div>
             </div>
             <div className="space-y-4">
-              <h2 className="text-4xl font-black italic tracking-tight">Matching...</h2>
+              <h2 className="text-4xl font-black italic tracking-tight animate-pulse">Searching...</h2>
               <div className="bg-white/5 border border-white/10 px-6 py-2 rounded-full inline-block backdrop-blur-md">
                 <span className="text-indigo-400 text-[11px] font-black uppercase tracking-widest">{statusMsg}</span>
               </div>
             </div>
             <button onClick={cleanup} className="text-slate-500 font-bold hover:text-white transition-colors py-2 px-6 border border-white/5 rounded-full hover:bg-white/5">إلغاء البحث</button>
+          </div>
+        )}
+
+        {appState === AppState.ERROR && (
+          <div className="animate-in zoom-in-95 flex flex-col items-center gap-8">
+            <div className="w-24 h-24 rounded-full bg-red-500/10 flex items-center justify-center border border-red-500/20">
+              <svg className="w-12 h-12 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" strokeWidth={2} /></svg>
+            </div>
+            <div className="space-y-2">
+              <h2 className="text-3xl font-black italic">نأسف جداً!</h2>
+              <p className="text-slate-400 font-medium">{error}</p>
+            </div>
+            <button 
+              onClick={() => handleStart(selectedLang!)}
+              className="bg-indigo-600 hover:bg-indigo-500 text-white font-black px-12 py-5 rounded-3xl transition-all shadow-xl shadow-indigo-500/20 active:scale-95"
+            >
+              حاول مرة أخرى
+            </button>
+            <button onClick={cleanup} className="text-slate-500 font-bold">العودة للرئيسية</button>
           </div>
         )}
 
@@ -344,7 +390,7 @@ const App: React.FC = () => {
                   </div>
                 </div>
                 <div className="inline-flex items-center gap-2.5 text-green-400 text-xs font-black uppercase tracking-widest bg-green-500/10 px-6 py-2 rounded-full border border-green-500/20">
-                  <span className="w-2.5 h-2.5 bg-green-500 rounded-full animate-pulse shadow-[0_0_10px_rgba(34,197,94,0.5)]" />
+                  <span className="w-2.5 h-2.5 bg-green-500 rounded-full animate-pulse" />
                   Live in {LANGUAGES.find(l => l.code === selectedLang)?.name}
                 </div>
               </div>
@@ -353,7 +399,7 @@ const App: React.FC = () => {
             <div className={`flex items-center gap-8 z-20 ${isVideoActive ? 'fixed bottom-12' : ''}`}>
               <button 
                 onClick={() => isChatEnabled ? setIsChatOpen(true) : setToast({msg: `متبقي ${60 - elapsedTime} ثانية للدردشة`, target: 'chat'})}
-                className={`w-16 h-16 rounded-full flex items-center justify-center border transition-all shadow-xl ${isChatEnabled ? 'bg-white/10 border-white/20 hover:bg-white/20' : 'bg-white/5 border-transparent opacity-20 cursor-not-allowed'}`}
+                className={`w-16 h-16 rounded-full flex items-center justify-center border transition-all ${isChatEnabled ? 'bg-white/10 border-white/20' : 'bg-white/5 opacity-20 cursor-not-allowed'}`}
               >
                 <svg className="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" strokeWidth={2.5} /></svg>
               </button>
@@ -364,12 +410,12 @@ const App: React.FC = () => {
 
               <button 
                 onClick={() => enableVideo()}
-                className={`w-16 h-16 rounded-full flex items-center justify-center border transition-all shadow-xl ${isVideoActive ? 'bg-green-600 border-green-400' : isVideoEnabled ? 'bg-indigo-600 border-indigo-400 animate-pulse' : 'bg-white/5 border-transparent opacity-20 cursor-not-allowed'}`}
+                className={`w-16 h-16 rounded-full flex items-center justify-center border transition-all ${isVideoActive ? 'bg-green-600 border-green-400' : isVideoEnabled ? 'bg-indigo-600 border-indigo-400 animate-pulse' : 'bg-white/5 opacity-20 cursor-not-allowed'}`}
               >
                 <svg className="w-7 h-7" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" strokeWidth={2.5} /></svg>
               </button>
             </div>
-            {toast && <div className="fixed bottom-40 bg-white text-black px-6 py-2.5 rounded-2xl text-[11px] font-black animate-bounce z-50 shadow-2xl border-4 border-black/5 uppercase tracking-tighter">{toast.msg}</div>}
+            {toast && <div className="fixed bottom-40 bg-white text-black px-6 py-2.5 rounded-2xl text-[11px] font-black animate-bounce z-50 shadow-2xl uppercase tracking-tighter">{toast.msg}</div>}
           </div>
         )}
       </div>
@@ -385,7 +431,7 @@ const App: React.FC = () => {
           </div>
           <div className="flex-1 overflow-y-auto p-6 space-y-5">
             {messages.map((m, i) => (
-              <div key={i} className={`flex ${m.sender === 'me' ? 'justify-end' : 'justify-start'} animate-in slide-in-from-bottom-2`}>
+              <div key={i} className={`flex ${m.sender === 'me' ? 'justify-end' : 'justify-start'}`}>
                 <div className={`px-6 py-3.5 rounded-3xl max-w-[85%] text-sm font-semibold shadow-lg ${m.sender === 'me' ? 'bg-white text-black rounded-tr-none' : 'bg-indigo-600 text-white rounded-tl-none'}`}>
                   {m.text}
                 </div>
